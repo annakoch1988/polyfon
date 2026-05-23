@@ -1,0 +1,22 @@
+"""Application configuration loaded from environment."""
+from pydantic_settings import BaseSettings
+from typing import List
+
+
+class Settings(BaseSettings):
+    database_url: str = "sqlite+aiosqlite:///./polyfon.db"
+    polymarket_api_url: str = "https://clob.polymarket.com"
+    binance_ws_url: str = "wss://stream.binance.com:9443/ws"
+    coins: str = "BTC,ETH"
+    log_level: str = "INFO"
+
+    @property
+    def coin_list(self) -> List[str]:
+        return [c.strip().upper() for c in self.coins.split(",") if c.strip()]
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+settings = Settings()
