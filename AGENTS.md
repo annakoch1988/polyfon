@@ -6,7 +6,7 @@
 - **Language**: Python 3.11+
 - **Database**: SQLite (single file, portable)
 - **ORM**: SQLAlchemy 2.0 with async support (`aiosqlite` driver)
-- **HTTP**: `httpx` for REST API calls (market discovery)
+- **HTTP**: `httpx` for REST API calls (market discovery, orphan resolution)
 - **WebSocket**: `websockets` for Binance spot feeds AND Polymarket order book feeds
 - **CLI**: `click` + `rich` for terminal output
 - **Scientific**: `numpy`, `pandas`, `scipy`
@@ -18,9 +18,9 @@
 4. Implement 18 strategies (SLA, PMR, MPR, VIT, TDE, CRV, OBI, VPX, CLL, HMM, ROM, MIP, PFR, RND, HPE, KLD, ARL, EVT).
 5. Every strategy fits a common interface via `BaseStrategy` + `@register` decorator.
 6. Fee calculations strictly follow Polymarket docs: `fee = C * feeRate * p * (1 - p)`.
-7. Windows are 5-minute intervals aligned to clock boundaries.
+7. Windows are 5-minute intervals aligned to ET clock boundaries.
 8. Best-bid/ask carry-forward implemented in both WebSocket collector and execution engine.
-9. Outcomes resolved asynchronously via background resolver (planned).
+9. Outcomes resolved via Gamma API polling (`_resolve_orphans` runs every 60s in main loop) + WebSocket `market_resolved` events (best-effort; not emitted by Polymarket for automated 5-min markets).
 
 ## Architecture (single-process, asyncio-based)
 ```
@@ -34,7 +34,8 @@ CollectionOrchestrator:
     PolymarketDiscovery  →  REST API: find active 5-min crypto markets
     BinanceSpotCollector  →  WebSocket: spot prices → DB
     PolymarketBookCollector  →  WebSocket: best bid/ask → DB
-    WindowManager  →  open/close 5-min windows
+    WindowManager  →  timer-driven open/close at 5-min boundaries
+    _resolve_orphans  →  Gamma API resolution for past closed windows
 
 ExecutionEngine:
     loads StrategyRegistry → instantiates chosen strategy
@@ -43,8 +44,8 @@ ExecutionEngine:
     logs signal + simulates position (dry/shadow)
 
 Database (SQLite):
-    markets, windows, spot_prices, order_books,
-    trade_signals, positions, fee_params, config
+    run_sessions, windows, spot_prices, order_books,
+    trade_signals, positions, config
 ```
 
 ## WebSocket Details
@@ -65,7 +66,8 @@ Database (SQLite):
   - `price_change` — delta updates with best_bid / best_ask per asset_id
   - `best_bid_ask` — direct best bid/ask update
   - `last_trade_price` — trade execution event
-- **Ignored events**: `tick_size_change`, `new_market`, `market_resolved`
+   - `market_resolved` — outcome notification (fields: `winning_asset_id`, `winning_outcome`)
+- **Ignored events**: `tick_size_change`, `new_market`, `pong`
 
 ### Binance Spot
 - **URL**: `wss://stream.binance.com:9443/ws/<coins>@ticker`
@@ -78,7 +80,7 @@ polyfon/
     database.py        # SQLAlchemy async engine + session_scope
     models.py          # SQLAlchemy ORM models
     collector/
-        market_discovery.py   # Polymarket CLOB REST API discovery
+        market_discovery.py   # Polymarket CLOB REST API discovery + fetch_resolution()
         spot_collector.py     # Binance WebSocket spot feed
         book_collector.py     # Polymarket WebSocket book (best bid/ask + carry-forward)
         orchestrator.py       # Ties collectors + window manager together
@@ -123,13 +125,13 @@ class MyStrategy(BaseStrategy):
 ```
 
 ## Database Schema (SQLAlchemy)
-- **Market**: condition_id, token_id, title, category, fee_rate, tick_size, underlying, strike, status
-- **Window**: market_id, start_time, end_time, strike, outcome, status
-- **SpotPrice**: symbol, price, timestamp, source
-- **OrderBook**: market_id, window_id, best_bid, best_ask, bid_size, ask_size, last_trade_price, stale, timestamp
-- **TradeSignal**: strategy, window_id, direction, size, expected_edge, confidence, timestamp
-- **Position**: mode, market_id, window_id, strategy, side, entry_price, size, exit_price, pnl, fees_paid, status
-- **FeeParams**: market_id, fee_rate, maker_rate, rebate_rate
+- **RunSession**: id, started_at, finished_at (null = aborted/crashed)
+- **Window**: id, slug, title, underlying, start_et, end_et, outcome, status (pending/open/closed/resolved), run_session_id, up_token_id, down_token_id, condition_id, fee_rate, tick_size
+- **SpotPrice**: id, symbol, price, timestamp, source
+- **OrderBook**: id, window_id, token_id, best_bid, best_ask, bid_size, ask_size, last_trade_price, stale, timestamp
+- **TradeSignal**: id, strategy, window_id, direction, size, expected_edge, confidence, timestamp
+- **Position**: id, mode, window_id, strategy, side, entry_price, size, exit_price, pnl, fees_paid, status, opened_at, closed_at
+- **ConfigKV**: id, key, value
 
 ## Fee Rules
 - Taker fee: `fee = round(shares * fee_rate * price * (1 - price), 5)`
@@ -165,14 +167,27 @@ LOG_LEVEL=INFO
 
 ## Implementation Phases
 1. **Phase 1 (COMPLETE)**: Bootstrap — schema, config, WebSocket collectors, fair pricing, SLA strategy, dry mode, CLI.
-2. **Phase 2**: Shadow mode refinement, async resolution resolver thread.
+2. **Phase 2 (IN PROGRESS)**: Shadow mode refinement, session tracking, resolution engine (WS + API), orphan cleanup.
 3. **Phase 3**: Wet mode (CLOB API orders, private key). **POSTPONED.**
 4. **Phase 4**: Additional strategies (PMR, MPR, VIT, TDE, CRV, OBI, VPX, CLL, HMM, ROM, MIP, PFR, RND, HPE, KLD, ARL, EVT).
 5. **Phase 5**: Python ML bridge (GARCH, EVT, HMM, Hawkes) for advanced strategies.
 
+## Agent Protocol
+- After making any functional changes or achieving progress, update this file to reflect the current state. Do not wait to be asked.
+
 ## Notes for Future Agents
 - Always use `session_scope()` context manager for DB transactions.
-- All timestamps are UTC.
+- All timestamps are naive UTC stored in the DB; ET boundary semantics kept in `start_et` / `end_et`.
 - Carry-forward logic is in `PolymarketBookCollector`: if no message for >5s, emits stale record.
 - Use `StrategyRegistry.instantiate(name)` to create strategy instances.
 - Keep strategy logic stateless where possible; persist state via DB ConfigKV if needed.
+- `RunSession` tracks each collector start; `finished_at` null = interrupted.
+- Unfinished windows (open/pending from previous sessions) are DELETED at startup, not resolved.
+- Unfinished windows (open/pending from previous sessions) are DELETED at startup (`Maintenance` section), not resolved.
+- Resolution is done by `_resolve_orphans()` which polls the Gamma API (`fetch_resolution(slug)`) for closed-but-unresolved windows. It runs at startup during `Maintenance` and every 60s in the main loop.
+- Gamma API `fetch_resolution(slug)` uses `outcomePrices` (stringified JSON array, e.g. `'["1","0"]'`) not the `outcome` field (always `None` for automated markets). Maps "Up" → "Yes", "Down" → "No".
+- `_series_events` paginates through Gamma API results (skip=0,100,200,...) because the API returns stale events first; current events are typically at skip=600+.
+- Unresolved window tokens stay subscribed even after close, so `market_resolved` WebSocket events can still be received. However, Polymarket does NOT emit `market_resolved` events via WebSocket for automated 5-min markets.
+- Once a window is resolved (`outcome` set), its tokens are removed from the subscription on the next boundary update.
+- The `_window_manager` is timer-driven: sleeps to each 5-min ET boundary, opens/closes deterministically. No polling loop.
+- `_sync_windows` runs every 60s to discover new events; skips windows whose `start_et` is >1s in the past.

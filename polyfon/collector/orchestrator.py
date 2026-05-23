@@ -3,56 +3,41 @@ import asyncio
 import logging
 import signal
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
 
 from polyfon.config import settings
 from polyfon.database import session_scope
-from polyfon.models import Market, Window, SpotPrice, OrderBook
+from polyfon.models import Window, SpotPrice, OrderBook, RunSession
 from polyfon.collector.market_discovery import PolymarketDiscovery
 from polyfon.collector.spot_collector import BinanceSpotCollector
 from polyfon.collector.book_collector import PolymarketBookCollector
 
+ET_TZ = ZoneInfo("America/New_York")
 logger = logging.getLogger(__name__)
 console = Console()
 
 
-def _polymarket_url(condition_id: str, slug: Optional[str]) -> str:
-    if slug:
-        return f"https://polymarket.com/event/{slug}"
-    return f"https://polymarket.com/event/{condition_id}"
+def _fmt_et(dt: datetime) -> str:
+    """Format a naive-UTC datetime as a short ET-hour string."""
+    return dt.replace(tzinfo=timezone.utc).astimezone(ET_TZ).strftime("%I:%M %p ET").lstrip("0")
 
 
-def _next_window_boundary(now: datetime) -> datetime:
-    minute = (now.minute // 5) * 5
-    current_start = now.replace(minute=minute, second=0, microsecond=0)
-    if abs((now - current_start).total_seconds()) <= 1.0:
-        return current_start
-    return current_start + timedelta(minutes=5)
-
-
-@dataclass(frozen=True)
-class _SpotItem:
-    symbol: str
-    price: float
-    ts: datetime
-
-
-@dataclass(frozen=True)
-class _BookItem:
-    market_id: str
-    window_id: Optional[str]
-    best_bid: Optional[float]
-    best_ask: Optional[float]
-    bid_size: Optional[float]
-    ask_size: Optional[float]
-    last_trade_price: Optional[float]
-    ts: datetime
+def _next_window_boundary_et(now_utc: datetime) -> datetime:
+    """Next 5-min clock boundary in ET (returned as timezone-aware UTC)."""
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    now_et = now_utc.astimezone(ET_TZ)
+    minute = (now_et.minute // 5) * 5
+    boundary_et = now_et.replace(minute=minute, second=0, microsecond=0)
+    if abs((now_et - boundary_et).total_seconds()) <= 1.0:
+        return boundary_et.astimezone(timezone.utc)
+    return (boundary_et + timedelta(minutes=5)).astimezone(timezone.utc)
 
 
 class CollectionOrchestrator:
@@ -65,44 +50,45 @@ class CollectionOrchestrator:
         )
         self.book = PolymarketBookCollector(
             on_book=self._on_book,
+            on_resolution=self._on_resolution,
             carry_timeout_sec=5.0,
         )
-        self._markets: Dict[str, Dict] = {}
         self._running = False
         self._tasks: List[asyncio.Task] = []
+        self._discovered_windows: Dict[str, Window] = {}  # slug -> Window
+
+        self._spot_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
+        self._book_queue: asyncio.Queue = asyncio.Queue(maxsize=50000)
+        self._session_id: Optional[str] = None
+        self._session_started_at: Optional[datetime] = None
+
+        # Cache: token_id -> window_id for the hot book path
+        self._token_to_window: Dict[str, str] = {}
         self._book_active_tokens: set[str] = set()
-        self._book_paused: bool = True
 
-        self._spot_queue: asyncio.Queue[_SpotItem] = asyncio.Queue(maxsize=50000)
-        self._book_queue: asyncio.Queue[_BookItem] = asyncio.Queue(maxsize=50000)
-
-        # In-memory caches to avoid DB lookups on the hot book path.
-        self._market_id_by_token: Dict[str, str] = {}
-        self._window_id_by_market: Dict[str, Optional[str]] = {}
-        # Active windows deduped by slug (each event has 2 token_ids → 2 windows)
-        self._active_windows: Dict[str, Dict[str, Any]] = {}
-
-    # ---- persistence callbacks + workers ----------------------------------------
+    # ---- persistence callbacks + workers ---------------------------------------
 
     def _on_spot_price(self, symbol: str, price: float, ts: datetime) -> None:
         try:
-            self._spot_queue.put_nowait(_SpotItem(symbol, price, ts))
+            self._spot_queue.put_nowait((symbol, price, ts))
         except asyncio.QueueFull:
             logger.warning("Spot queue full – dropping tick for %s", symbol)
 
     async def _spot_worker(self) -> None:
         while self._running:
             try:
-                item = await asyncio.wait_for(self._spot_queue.get(), timeout=1.0)
+                symbol, price, ts = await asyncio.wait_for(
+                    self._spot_queue.get(), timeout=1.0
+                )
             except asyncio.TimeoutError:
                 continue
             async with session_scope() as sess:
                 sess.add(
                     SpotPrice(
                         id=str(uuid.uuid4()),
-                        symbol=item.symbol.upper(),
-                        price=item.price,
-                        timestamp=item.ts,
+                        symbol=symbol.upper(),
+                        price=price,
+                        timestamp=ts,
                         source="binance",
                     )
                 )
@@ -118,13 +104,10 @@ class CollectionOrchestrator:
         last_trade_price: Optional[float],
         ts: datetime,
     ) -> None:
-        market_id = self._market_id_by_token.get(token_id)
-        if not market_id:
-            return
-        window_id = self._window_id_by_market.get(market_id)
+        window_id = self._token_to_window.get(token_id)
         try:
             self._book_queue.put_nowait(
-                _BookItem(market_id, window_id, best_bid, best_ask, bid_size, ask_size, last_trade_price, ts)
+                (token_id, window_id, best_bid, best_ask, bid_size, ask_size, last_trade_price, ts)
             )
         except asyncio.QueueFull:
             logger.warning("Book queue full – dropping update for %s", token_id)
@@ -132,7 +115,7 @@ class CollectionOrchestrator:
     async def _book_worker(self) -> None:
         BATCH_SIZE = 500
         while self._running:
-            batch: list[_BookItem] = []
+            batch: list = []
             try:
                 batch.append(await asyncio.wait_for(self._book_queue.get(), timeout=1.0))
             except asyncio.TimeoutError:
@@ -145,223 +128,103 @@ class CollectionOrchestrator:
                     break
 
             async with session_scope() as sess:
-                for item in batch:
+                for token_id, window_id, best_bid, best_ask, bid_size, ask_size, ltp, ts in batch:
                     sess.add(
                         OrderBook(
                             id=str(uuid.uuid4()),
-                            market_id=item.market_id,
-                            window_id=item.window_id,
-                            best_bid=item.best_bid,
-                            best_ask=item.best_ask,
-                            bid_size=item.bid_size,
-                            ask_size=item.ask_size,
-                            last_trade_price=item.last_trade_price,
+                            window_id=window_id,
+                            token_id=token_id,
+                            best_bid=best_bid,
+                            best_ask=best_ask,
+                            bid_size=bid_size,
+                            ask_size=ask_size,
+                            last_trade_price=ltp,
                             stale=False,
-                            timestamp=item.ts,
+                            timestamp=ts,
                         )
                     )
             for _ in batch:
                 self._book_queue.task_done()
 
-    # ---- low-frequency progress logging ---------------------------------------
+    # ---- progress logging -----------------------------------------------------
 
     def _log_status(self) -> None:
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        if not self._active_windows:
+        active = [w for w in self._discovered_windows.values() if w.status == "open"]
+        if not active:
             console.print(
                 f"[dim]{now_str}[/] Collecting [bold]{', '.join(self.coins)}[/]  "
                 f"| [dim]waiting for next window[/]"
             )
         else:
             parts = []
-            for slug, info in sorted(self._active_windows.items()):
-                parts.append(
-                    f"{info['underlying']} {info['start'].strftime('%H:%M')}–{info['end'].strftime('%H:%M')}"
-                )
+            for w in active:
+                parts.append(f"{w.underlying} {_fmt_et(w.start_et)}–{_fmt_et(w.end_et)}")
             console.print(
                 f"[dim]{now_str}[/] Collecting [bold]{', '.join(self.coins)}[/]  "
                 f"| [green]{'  '.join(parts)}[/]"
             )
 
-    # ---- market & window management ------------------------------------------
+    # ---- window management ----------------------------------------------------
 
-    async def _sync_markets(self) -> None:
-        markets = await self.discovery.discover_crypto_5min(coins=self.coins)
+    async def _sync_windows(self) -> None:
+        """Discover events and upsert Window records."""
+        now_n = self._naive_utc(datetime.now(timezone.utc))
+        events = await self.discovery.discover_crypto_5min(coins=self.coins)
+
         async with session_scope() as sess:
-            for m in markets:
-                tid = m.get("token_id")
-                cid = m.get("condition_id")
-                if not tid:
-                    continue
-                self._markets[tid] = m
-                result = await sess.execute(select(Market).where(Market.token_id == tid))
+            for ev in events:
+                slug = ev["slug"]
+                result = await sess.execute(select(Window).where(Window.slug == slug))
                 existing = result.scalar_one_or_none()
+
                 if existing:
-                    self._market_id_by_token[tid] = existing.id
-                    existing.slug = m.get("slug") or existing.slug
-                    existing.title = m.get("title") or existing.title
-                    existing.underlying = m.get("underlying") or self._extract_underlying(m)
-                    existing.strike = m.get("strike") if m.get("strike") is not None else self._extract_strike(m)
-                    existing.resolution_time = self._extract_resolution_time(m)
+                    existing.title = ev["title"]
+                    existing.underlying = ev["underlying"]
+                    existing.start_et = ev["start_utc"]
+                    existing.end_et = ev["end_utc"]
+                    existing.up_token_id = ev["up_token_id"]
+                    existing.down_token_id = ev["down_token_id"]
+                    existing.condition_id = ev["condition_id"]
+                    existing.fee_rate = ev["fee_rate"]
+                    existing.tick_size = ev["tick_size"]
+                    self._discovered_windows[slug] = existing
                 else:
-                    underlying = m.get("underlying") or self._extract_underlying(m)
-                    strike = m.get("strike") if m.get("strike") is not None else self._extract_strike(m)
-                    market = Market(
+                    # Skip windows whose slot started too long ago —
+                    # they'll never be opened by the window manager.
+                    if ev["start_utc"] < now_n - timedelta(seconds=1):
+                        continue
+                    win = Window(
                         id=str(uuid.uuid4()),
-                        condition_id=cid or tid,
-                        token_id=tid,
-                        slug=m.get("slug"),
-                        title=m.get("title") or "Unknown",
-                        category=m.get("category", "crypto").lower(),
-                        fees_enabled=True,
-                        fee_rate=float(m.get("fee_rate", 0.07)),
-                        tick_size=float(m.get("tick_size", 0.01)),
-                        neg_risk=m.get("neg_risk", False),
-                        underlying=underlying,
-                        strike=strike,
-                        resolution_time=self._extract_resolution_time(m),
-                        status="active",
+                        slug=slug,
+                        title=ev["title"],
+                        underlying=ev["underlying"],
+                        start_et=ev["start_utc"],
+                        end_et=ev["end_utc"],
+                        up_token_id=ev["up_token_id"],
+                        down_token_id=ev["down_token_id"],
+                        condition_id=ev["condition_id"],
+                        fee_rate=ev["fee_rate"],
+                        tick_size=ev["tick_size"],
+                        status="pending",
+                        run_session_id=self._session_id,
                     )
-                    self._market_id_by_token[tid] = market.id
-                    sess.add(market)
-
-    def _extract_underlying(self, market: Dict) -> str:
-        title = (market.get("title") or "").upper()
-        for c in self.coins:
-            if c in title:
-                return c
-        return "BTC"
-
-    def _extract_strike(self, market: Dict) -> Optional[float]:
-        title = market.get("title") or ""
-        if "up or down" in title.lower():
-            return None
-        import re
-        m = re.search(r"\$?([0-9,]+(?:\.[0-9]+)?)", title)
-        if m:
-            return float(m.group(1).replace(",", ""))
-        return None
-
-    def _extract_resolution_time(self, market: Dict) -> Optional[datetime]:
-        ts = market.get("resolution_time") or market.get("end_date_iso") or market.get("endDate")
-        if ts:
-            try:
-                if isinstance(ts, str):
-                    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except Exception:
-                pass
-        slug = market.get("slug", "")
-        import re
-        m = re.search(r"-([0-9]{10})$", slug)
-        if m:
-            return datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)
-        return None
+                    self._discovered_windows[slug] = win
+                    sess.add(win)
 
     @staticmethod
-    def _market_window(market: Market) -> Optional[tuple[datetime, datetime]]:
-        if not market.resolution_time:
-            return None
-        end = market.resolution_time
-        start = end - timedelta(minutes=5)
-        return start, end
+    def _naive_utc(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
-    async def _open_market_windows(self, now: datetime) -> None:
-        async with session_scope() as sess:
-            result = await sess.execute(
-                select(Market).where(Market.status == "active", Market.underlying.in_(self.coins))
-            )
-            markets = result.scalars().all()
-
-            for market in markets:
-                slot = self._market_window(market)
-                if not slot:
-                    continue
-                start, end = slot
-                # SQLite strips tz on write; assume UTC if naive
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=timezone.utc)
-                if end.tzinfo is None:
-                    end = end.replace(tzinfo=timezone.utc)
-                if not (start <= now < end):
-                    continue
-
-                res_existing = await sess.execute(
-                    select(Window).where(
-                        Window.market_id == market.id,
-                        Window.status == "open",
-                    )
-                )
-                if res_existing.scalar_one_or_none():
-                    continue
-
-                win = Window(
-                    id=str(uuid.uuid4()),
-                    market_id=market.id,
-                    start_time=start,
-                    end_time=end,
-                    strike=market.strike or 0.0,
-                    status="open",
-                )
-                self._window_id_by_market[market.id] = win.id
-                sess.add(win)
-                if market.slug:
-                    self._active_windows[market.slug] = {
-                        "underlying": market.underlying,
-                        "title": market.title,
-                        "start": start,
-                        "end": end,
-                    }
-
-    async def _close_expired_windows(self, now: datetime) -> None:
-        async with session_scope() as sess:
-            res = await sess.execute(
-                select(Window, Market)
-                .join(Market, Window.market_id == Market.id)
-                .where(
-                    Window.status == "open",
-                    Window.end_time <= now,
-                )
-            )
-            for win, market in res.all():
-                self._window_id_by_market.pop(market.id, None)
-                win.status = "closed"
-                if market.slug:
-                    self._active_windows.pop(market.slug, None)
-
-            stale_res = await sess.execute(
-                select(Market).where(
-                    Market.status == "active",
-                    Market.resolution_time <= now - timedelta(minutes=5),
-                )
-            )
-            for mkt in stale_res.scalars():
-                mkt.status = "closed"
-                win_res = await sess.execute(
-                    select(Window).where(
-                        Window.market_id == mkt.id,
-                        Window.status == "open",
-                    )
-                )
-                for stale_win in win_res.scalars():
-                    self._window_id_by_market.pop(mkt.id, None)
-                    stale_win.status = "closed"
-
-    async def _show_skipped(self) -> None:
-        async with session_scope() as sess:
-            res = await sess.execute(
-                select(Window, Market)
-                .join(Market, Window.market_id == Market.id)
-                .where(Window.status == "open")
-            )
-            rows = list(res.all())
-            if rows:
-                console.print(
-                    f"\n[bold yellow]\u26a0 {len(rows)} in-progress window(s) "
-                    f"from previous run will be skipped[/]"
-                )
+    def _log_window(self, action: str, win: Window) -> None:
+        color = {"OPEN": "green", "CLOSED": "red"}.get(action, "white")
+        console.print(
+            f"  [{color}]{action:6}[/] {win.underlying} "
+            f"{_fmt_et(win.start_et)}–{_fmt_et(win.end_et)}  "
+            f"[dim]{win.slug}[/]  [{color}]{win.title}[/]"
+        )
 
     async def _responsive_sleep(self, seconds: float) -> None:
-        """Sleep up to *seconds* but return early if _running becomes False."""
         for _ in range(int(seconds)):
             if not self._running:
                 return
@@ -371,17 +234,83 @@ class CollectionOrchestrator:
             await asyncio.sleep(remainder)
 
     async def _window_manager(self) -> None:
+        """Timer-driven window open/close at 5-min ET clock boundaries.
+
+        Sleeps precisely to each boundary, opens the current window and
+        closes the previous one, then sleeps 5 min to the next boundary.
+        No polling, no grace windows.
+        """
         while self._running:
             now = datetime.now(timezone.utc)
-            await self._close_expired_windows(now)
-            await self._open_market_windows(now)
-            await self._responsive_sleep(10)
+            next_boundary = _next_window_boundary_et(now)
+            dt = (next_boundary - now).total_seconds()
+            if dt > 0:
+                await self._responsive_sleep(dt)
+            if not self._running:
+                break
+
+            now_n = self._naive_utc(next_boundary)
+            changed = False
+
+            async with session_scope() as sess:
+                # Close open windows ending at this boundary
+                result = await sess.execute(
+                    select(Window).where(
+                        Window.status == "open",
+                        Window.end_et >= now_n - timedelta(seconds=1),
+                        Window.end_et <= now_n + timedelta(seconds=1),
+                    )
+                )
+                for win in result.scalars():
+                    win.status = "closed"
+                    self._discovered_windows[win.slug] = win
+                    self._token_to_window.pop(win.up_token_id, None)
+                    self._token_to_window.pop(win.down_token_id, None)
+                    self._log_window("CLOSED", win)
+                    changed = True
+
+                # Open pending windows starting at this boundary
+                result = await sess.execute(
+                    select(Window).where(
+                        Window.status == "pending",
+                        Window.start_et >= now_n - timedelta(seconds=1),
+                        Window.start_et <= now_n + timedelta(seconds=1),
+                    )
+                )
+                for win in result.scalars():
+                    win.status = "open"
+                    self._discovered_windows[win.slug] = win
+                    self._token_to_window[win.up_token_id] = win.id
+                    self._token_to_window[win.down_token_id] = win.id
+                    self._log_window("OPEN", win)
+                    changed = True
+
+            # Update book subscription when tokens change.
+            # Keep unresolved windows subscribed (including closed ones)
+            # so market_resolved WebSocket events are still received.
+            if changed:
+                all_ids = list(self._token_to_window.keys())
+                async with session_scope() as sess:
+                    result = await sess.execute(
+                        select(Window).where(
+                            Window.outcome.is_(None),
+                            Window.underlying.in_(self.coins),
+                        )
+                    )
+                    for win in result.scalars():
+                        all_ids.extend([win.up_token_id, win.down_token_id])
+                all_ids = list(set(all_ids))
+                if self._book_active_tokens and set(all_ids) != self._book_active_tokens:
+                    await self.book.update_assets(all_ids)
+                    self._book_active_tokens = set(all_ids)
+
+    # ---- shutdown -------------------------------------------------------------
 
     def _shutdown(self) -> None:
-        console.print("\n[bold red]\u26a0 Shutdown signal received — stopping...[/]")
+        console.print("\n[bold red]Shutdown signal received — stopping...[/]")
         self._running = False
 
-    # ---- public API ----------------------------------------------------------
+    # ---- public API -----------------------------------------------------------
 
     async def run(self) -> None:
         self._running = True
@@ -393,80 +322,128 @@ class CollectionOrchestrator:
             except NotImplementedError:
                 pass
 
-        await self._sync_markets()
+        # Create a run session for this collector start
+        async with session_scope() as sess:
+            self._session_started_at = self._naive_utc(datetime.now(timezone.utc))
+            session = RunSession(
+                id=str(uuid.uuid4()),
+                started_at=self._session_started_at,
+            )
+            sess.add(session)
+            self._session_id = session.id
 
         now = datetime.now(timezone.utc)
+        now_n = self._naive_utc(now)
 
-        table = Table(title="Discovered 5-min Crypto Markets", show_lines=True)
-        table.add_column("Underlying", style="cyan")
-        table.add_column("Strike", style="magenta")
-        table.add_column("Title", style="green")
-        table.add_column("Polymarket URL", style="blue")
+        console.print("\n[bold cyan]Maintenance[/]")
 
+        # 1. Delete unfinished windows (pending + open) from other runs.
+        removed = 0
         async with session_scope() as sess:
             result = await sess.execute(
-                select(Market).where(
-                    Market.status == "active",
-                    Market.underlying.in_(self.coins),
-                    Market.resolution_time > now,
+                select(Window).where(
+                    Window.status.in_(["pending", "open"]),
+                    Window.run_session_id != self._session_id,
+                    Window.run_session_id.isnot(None),
                 )
             )
-            db_markets = result.scalars().all()
-            seen_slugs: set[str] = set()
-            for market in db_markets:
-                if market.slug in seen_slugs:
-                    continue
-                seen_slugs.add(market.slug)
-                url = _polymarket_url(market.condition_id, market.slug)
-                table.add_row(
-                    market.underlying,
-                    str(market.strike) if market.strike else "\u2014",
-                    market.title,
-                    url,
+            for win in result.scalars():
+                removed += 1
+                self._discovered_windows.pop(win.slug, None)
+                self._token_to_window.pop(win.up_token_id, None)
+                self._token_to_window.pop(win.down_token_id, None)
+                underlying = win.underlying
+                start_fmt = _fmt_et(win.start_et)
+                end_fmt = _fmt_et(win.end_et)
+                console.print(
+                    f"  [red]REMOVED[/] {underlying} {start_fmt}–{end_fmt}  (run: {win.run_session_id})"
+                )
+                await sess.delete(win)
+        if not removed:
+            console.print("  [dim]No unfinished windows to remove[/]")
+
+        # 2. Resolve closed-but-unresolved windows via API.
+        resolved = await self._resolve_orphans()
+        if not resolved:
+            console.print("  [dim]No orphan windows to resolve[/]")
+
+        # 3. Discover and create pending windows for the current run.
+        await self._sync_windows()
+
+        # Load any existing windows into the cache
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.status.in_(["pending", "open"]),
+                    Window.underlying.in_(self.coins),
+                )
+            )
+            for win in result.scalars():
+                self._discovered_windows[win.slug] = win
+                if win.status == "open":
+                    self._token_to_window[win.up_token_id] = win.id
+                    self._token_to_window[win.down_token_id] = win.id
+
+        # Log discovered future windows
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.underlying.in_(self.coins),
+                    Window.end_et > now_n,
+                ).order_by(Window.start_et)
+            )
+            for win in result.scalars():
+                console.print(
+                    f"  [cyan]DISCOVERED[/] {win.underlying} "
+                    f"{_fmt_et(win.start_et)}–{_fmt_et(win.end_et)}  "
+                    f"[dim]{win.slug}[/]  "
+                    f"[dim]https://polymarket.com/event/{win.slug}[/]"
                 )
 
-        console.print(table)
-
-        # If we're mid-window, show which one and wait for the next boundary
-        next_boundary = _next_window_boundary(now)
+        # Mid-window check
+        next_boundary = _next_window_boundary_et(now)
         if now < next_boundary:
             wait_sec = (next_boundary - now).total_seconds()
-            mid_title = None
+            mid_slot = None
+            mid_underlying = None
             async with session_scope() as sess:
-                res = await sess.execute(
-                    select(Market).where(
-                        Market.status == "active",
-                        Market.underlying.in_(self.coins),
-                    )
+                result = await sess.execute(
+                    select(Window).where(
+                        Window.underlying.in_(self.coins),
+                        Window.start_et <= now_n,
+                        Window.end_et > now_n,
+                    ).limit(1)
                 )
-                for mkt in res.scalars():
-                    slot = self._market_window(mkt)
-                    if not slot:
-                        continue
-                    s, e = slot
-                    if s.tzinfo is None:
-                        s = s.replace(tzinfo=timezone.utc)
-                    if e.tzinfo is None:
-                        e = e.replace(tzinfo=timezone.utc)
-                    if s <= now < e:
-                        mid_title = mkt.title
-                        break
-            msg = f"\n[bold yellow]Mid-window start — waiting {wait_sec:.0f}s until next boundary"
-            if mid_title:
-                msg += f" ({mid_title})"
-            msg += "[/]"
+                mid = result.scalar_one_or_none()
+                if mid:
+                    mid_slot = f"{_fmt_et(mid.start_et)}–{_fmt_et(mid.end_et)}"
+                    mid_underlying = mid.underlying
+            session_start_str = _fmt_et(self._session_started_at)
+            msg = f"\n[yellow]Session started at {session_start_str}  (run: {self._session_id})"
+            if mid_slot:
+                msg += f"  |  Mid-window (skipping): {mid_underlying} {mid_slot}"
+            msg += f"  |  Next boundary in {wait_sec:.0f}s at {_fmt_et(next_boundary)}[/]"
             console.print(msg)
 
         self.spot.start()
 
-        now = datetime.now(timezone.utc)
-        await self._close_expired_windows(now)
-        await self._show_skipped()
+        # Start book collector immediately so it can receive
+        # market_resolved events even during the mid-window wait.
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.status.in_(["pending", "open"]),
+                    Window.underlying.in_(self.coins),
+                )
+            )
+            initial_ids = [t for w in result.scalars() for t in (w.up_token_id, w.down_token_id)]
+        if initial_ids:
+            self.book.start(initial_ids)
+            self._book_active_tokens = set(initial_ids)
 
         self._tasks.append(asyncio.create_task(self._spot_worker()))
         self._tasks.append(asyncio.create_task(self._book_worker()))
         self._tasks.append(asyncio.create_task(self._window_manager()))
-        self._tasks.append(asyncio.create_task(self._book_resume_loop()))
 
         ticks = 0
         while self._running:
@@ -474,44 +451,81 @@ class CollectionOrchestrator:
             ticks += 1
             if ticks >= 60 and self._running:
                 ticks = 0
-                await self._sync_markets()
+                await self._sync_windows()
+                await self._resolve_orphans()
             if ticks % 30 == 0 and self._running:
                 self._log_status()
 
-    async def _book_resume_loop(self) -> None:
-        while self._running:
-            now = datetime.now(timezone.utc)
-            next_boundary = _next_window_boundary(now)
-            if now < next_boundary:
-                await self._responsive_sleep((next_boundary - now).total_seconds())
-            else:
-                await self._responsive_sleep(1)
-                continue
+    def _on_resolution(self, token_id: str, outcome: str) -> None:
+        """Handle a market_resolved WebSocket event.
 
-            if not self._running:
-                break
+        Looks up the window by token_id in the DB — the in-memory
+        ``_token_to_window`` cache is only live while a window is open,
+        but resolution events can arrive minutes later.
+        """
+        asyncio.create_task(self._apply_resolution(token_id, outcome))
 
-            current_ids = list(self._markets.keys())
-            if current_ids:
-                if not self._book_active_tokens:
-                    console.print(
-                        f"\n[bold green]\u25b6 Starting book collection at {next_boundary.strftime('%H:%M:%S')} UTC[/]"
-                    )
-                    self.book.start(current_ids)
-                elif self._book_active_tokens != set(current_ids):
-                    console.print(
-                        f"\n[bold blue]\u21bb Updating book subscriptions at {next_boundary.strftime('%H:%M:%S')} UTC[/]"
-                    )
-                    await self.book.update_assets(current_ids)
-                self._book_active_tokens = set(current_ids)
-                self._book_paused = False
+    async def _apply_resolution(self, token_id: str, outcome: str) -> None:
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.status.in_(["open", "closed"]),
+                    Window.outcome.is_(None),
+                    or_(Window.up_token_id == token_id, Window.down_token_id == token_id),
+                )
+            )
+            w = result.scalar_one_or_none()
+            if w:
+                w.outcome = outcome
+                w.status = "resolved"
+                console.print(
+                    f"  [green]RESOLVED[/] {w.underlying} "
+                    f"{_fmt_et(w.start_et)}–{_fmt_et(w.end_et)}  "
+                    f"[bold]{outcome}[/]  "
+                    f"(run: {w.run_session_id})  "
+                    f"[dim]https://polymarket.com/event/{w.slug}[/]"
+                )
 
-            now = datetime.now(timezone.utc)
-            next_boundary = _next_window_boundary(now)
-            await self._responsive_sleep(max(1.0, (next_boundary - now).total_seconds()))
+    async def _resolve_orphans(self) -> int:
+        """Resolve closed-but-unresolved windows via Gamma API.
+
+        Returns the number of windows resolved.
+        """
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.outcome.is_(None),
+                    Window.status == "closed",
+                )
+            )
+            orphans = result.scalars().all()
+
+        resolved = 0
+        for win in orphans:
+            outcome = await self.discovery.fetch_resolution(win.slug)
+            if outcome:
+                resolved += 1
+                async with session_scope() as sess:
+                    w = await sess.get(Window, win.id)
+                    if w and w.outcome is None:
+                        w.outcome = outcome
+                        w.status = "resolved"
+                        console.print(
+                            f"  [green]RESOLVED (API)[/] {w.underlying} "
+                            f"{_fmt_et(w.start_et)}–{_fmt_et(w.end_et)}  "
+                            f"[bold]{outcome}[/]  "
+                            f"(run: {w.run_session_id})  "
+                            f"[dim]https://polymarket.com/event/{w.slug}[/]"
+                        )
+        return resolved
 
     async def stop(self) -> None:
         self._running = False
+        if self._session_id:
+            async with session_scope() as sess:
+                session = await sess.get(RunSession, self._session_id)
+                if session:
+                    session.finished_at = self._naive_utc(datetime.now(timezone.utc))
         await self.spot.stop()
         await self.book.stop()
         for t in self._tasks:

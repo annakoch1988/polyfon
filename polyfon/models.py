@@ -3,8 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    Column, Integer, Float, String, Boolean, DateTime, ForeignKey,
-    create_engine, event
+    Column, Float, String, Boolean, DateTime, ForeignKey,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.sql import func
@@ -14,50 +13,55 @@ class Base(DeclarativeBase):
     pass
 
 
-class Market(Base):
-    __tablename__ = "markets"
+class RunSession(Base):
+    """Tracks a single collector run.
+
+    ``finished_at`` is set on graceful shutdown; a null value indicates
+    the session was aborted (SIGKILL / crash).
+    """
+    __tablename__ = "run_sessions"
 
     id = Column(String, primary_key=True)
-    condition_id = Column(String, nullable=False)
-    token_id = Column(String, unique=True, nullable=False)
-    slug = Column(String, nullable=True)
-    title = Column(String, nullable=False)
-    category = Column(String, nullable=False, default="crypto")
-    fees_enabled = Column(Boolean, default=True)
-    fee_rate = Column(Float, default=0.07)
-    tick_size = Column(Float, default=0.01)
-    neg_risk = Column(Boolean, default=False)
-    underlying = Column(String, nullable=False)  # BTC, ETH, etc.
-    strike = Column(Float, nullable=True)
-    resolution_time = Column(DateTime, nullable=True)
-    status = Column(String, default="active")  # active, closed, resolved
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    started_at = Column(DateTime, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
 
-    windows = relationship("Window", back_populates="market", cascade="all, delete-orphan")
-    order_books = relationship("OrderBook", back_populates="market")
-    positions = relationship("Position", back_populates="market")
-    fee_params = relationship("FeeParams", back_populates="market", uselist=False)
+    windows = relationship("Window", back_populates="run_session")
 
 
 class Window(Base):
+    """A single 5-minute prediction market window.
+
+    Replaces the old ``Market`` + ``Window`` split.  One row per event
+    (e.g. "BTC Up or Down, 9:05-9:10PM ET") with both UP/DOWN token IDs.
+
+    Times are stored as naive UTC but represent ET window boundaries.
+    """
     __tablename__ = "windows"
 
     id = Column(String, primary_key=True)
-    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
-    start_time = Column(DateTime, nullable=False)
-    end_time = Column(DateTime, nullable=False)
-    resolution_time = Column(DateTime, nullable=True)
-    strike = Column(Float, nullable=False)
-    outcome = Column(String, nullable=True)  # YES, NO, UNRESOLVED
-    status = Column(String, default="open")  # open, closed, resolving, resolved
+    slug = Column(String, unique=True, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    underlying = Column(String, nullable=False)  # BTC, ETH
+    start_et = Column(DateTime, nullable=False)
+    end_et = Column(DateTime, nullable=False)
+    outcome = Column(String, nullable=True)  # "Yes" (UP) or "No" (DOWN), once resolved
+    status = Column(String, default="pending")  # pending, open, closed, resolved
+    run_session_id = Column(String, ForeignKey("run_sessions.id"), nullable=True)
+
+    # Polymarket internal metadata (needed for WS subscription + fees)
+    up_token_id = Column(String, nullable=False)
+    down_token_id = Column(String, nullable=False)
+    condition_id = Column(String, nullable=False)
+    fee_rate = Column(Float, default=0.07)
+    tick_size = Column(Float, default=0.01)
+
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
-    market = relationship("Market", back_populates="windows")
-    order_books = relationship("OrderBook", back_populates="window")
-    positions = relationship("Position", back_populates="window")
-    trade_signals = relationship("TradeSignal", back_populates="window")
+    run_session = relationship("RunSession", back_populates="windows")
+    order_books = relationship("OrderBook", back_populates="window", cascade="all, delete-orphan")
+    trade_signals = relationship("TradeSignal", back_populates="window", cascade="all, delete-orphan")
+    positions = relationship("Position", back_populates="window", cascade="all, delete-orphan")
 
 
 class SpotPrice(Base):
@@ -75,8 +79,8 @@ class OrderBook(Base):
     __tablename__ = "order_books"
 
     id = Column(String, primary_key=True)
-    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
     window_id = Column(String, ForeignKey("windows.id"), nullable=True)
+    token_id = Column(String, nullable=False)
     best_bid = Column(Float, nullable=True)
     best_ask = Column(Float, nullable=True)
     bid_size = Column(Float, nullable=True)
@@ -86,7 +90,6 @@ class OrderBook(Base):
     timestamp = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=func.now())
 
-    market = relationship("Market", back_populates="order_books")
     window = relationship("Window", back_populates="order_books")
 
 
@@ -111,7 +114,6 @@ class Position(Base):
 
     id = Column(String, primary_key=True)
     mode = Column(String, nullable=False)  # dry, shadow, wet
-    market_id = Column(String, ForeignKey("markets.id"), nullable=False)
     window_id = Column(String, ForeignKey("windows.id"), nullable=True)
     strategy = Column(String, nullable=True)
     side = Column(String, nullable=False)  # LONG_YES, LONG_NO, SHORT_YES
@@ -126,21 +128,7 @@ class Position(Base):
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
-    market = relationship("Market", back_populates="positions")
     window = relationship("Window", back_populates="positions")
-
-
-class FeeParams(Base):
-    __tablename__ = "fee_params"
-
-    id = Column(String, primary_key=True)
-    market_id = Column(String, ForeignKey("markets.id"), unique=True, nullable=False)
-    fee_rate = Column(Float, default=0.07)
-    maker_rate = Column(Float, default=0.0)
-    rebate_rate = Column(Float, default=0.20)
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-
-    market = relationship("Market", back_populates="fee_params")
 
 
 class ConfigKV(Base):

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Any
 
 import websockets
+from websockets import State
 from websockets.exceptions import ConnectionClosed
 
 from polyfon.config import settings
@@ -41,9 +42,11 @@ class PolymarketBookCollector:
         on_book: Optional[Callable[[str, Optional[float], Optional[float],
                                      Optional[float], Optional[float],
                                      Optional[float], datetime], None]] = None,
+        on_resolution: Optional[Callable[[str, str], None]] = None,
         carry_timeout_sec: float = 5.0,
     ):
         self.on_book = on_book
+        self.on_resolution = on_resolution
         self.carry_timeout_sec = carry_timeout_sec
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -258,6 +261,16 @@ class PolymarketBookCollector:
                 break
             await asyncio.sleep(self.PING_INTERVAL)
 
+    def _handle_resolution(self, msg: Dict[str, Any]) -> None:
+        """Handle market_resolved event."""
+        asset_id = msg.get("winning_asset_id", "")
+        outcome = msg.get("winning_outcome")
+        if asset_id and outcome in ("Yes", "No") and self.on_resolution:
+            try:
+                self.on_resolution(asset_id, outcome)
+            except Exception:
+                pass
+
     async def _handle_message(self, msg: Dict[str, Any]) -> None:
         """Route incoming messages by event_type."""
         event_type = msg.get("event_type")
@@ -269,7 +282,17 @@ class PolymarketBookCollector:
             self._handle_best_bid_ask(msg)
         elif event_type == "last_trade_price":
             self._handle_last_trade(msg)
-        # Ignore: tick_size_change, new_market, market_resolved, pong
+        elif event_type == "market_resolved":
+            self._handle_resolution(msg)
+            # Debug: log raw message to stderr for now
+            import sys
+            print(f"[RESOLUTION EVENT] {msg}", file=sys.stderr, flush=True)
+        elif event_type in ("tick_size_change", "new_market", "pong", None):
+            pass
+        else:
+            # Debug: log unknown event types
+            import sys
+            print(f"[UNKNOWN EVENT] type={event_type!r} msg={msg!r}", file=sys.stderr, flush=True)
 
     async def _carry_forward_loop(self) -> None:
         """Background task: emit stale carry-forward records for silent tokens."""
@@ -296,7 +319,7 @@ class PolymarketBookCollector:
         """Update the subscription list without reconnecting."""
         async with self._lock:
             self._assets_ids = list(asset_ids)
-            if self._ws and self._ws.open:
+            if self._ws and self._ws.state == State.OPEN:
                 try:
                     await self._ws.send(json.dumps(self._update_subscription_message(self._assets_ids)))
                 except Exception:
