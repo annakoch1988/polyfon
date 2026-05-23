@@ -191,6 +191,9 @@ class ExecutionEngine:
         if price is None:
             return
 
+        if signal.size < 5 or signal.size * price < 1.0:
+            return
+
         fee_rate = window.fee_rate or 0.07
         fee = taker_fee_usdc(signal.size, price, fee_rate)
 

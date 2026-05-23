@@ -1,7 +1,9 @@
 """CLI entry point for polyfon."""
 import asyncio
+import inspect
 import click
 from rich.console import Console
+from rich.table import Table
 
 from polyfon.config import settings
 from polyfon.database import init_db
@@ -25,7 +27,6 @@ def _parse_strategy_params(params: tuple[str, ...]) -> dict:
         key, raw = p.split("=", 1)
         key = key.strip().lstrip("-").replace("-", "_")
         raw = raw.strip()
-        # Type inference: int → float → bool → str
         try:
             kwargs[key] = int(raw)
         except ValueError:
@@ -37,6 +38,23 @@ def _parse_strategy_params(params: tuple[str, ...]) -> dict:
                 else:
                     kwargs[key] = raw
     return kwargs
+
+
+def _print_strategy_params(strat_class: type, overrides: dict) -> dict:
+    """Instantiate strategy, print all params (defaults + overrides), return instance."""
+    instance = strat_class(**overrides)
+    sig = inspect.signature(strat_class.__init__)
+    param_names = [n for n in sig.parameters if n != "self"]
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    for name in param_names:
+        override = overrides.get(name)
+        value = getattr(instance, name)
+        if override is not None:
+            table.add_row(f"  {name}", str(value), "[yellow](overridden)[/]")
+        else:
+            table.add_row(f"  {name}", str(value), "[dim]default[/]")
+    console.print(table)
+    return instance
 
 
 @click.group()
@@ -80,8 +98,7 @@ def dry(strategy: str, coins: str | None, do_collect: bool, params: tuple[str, .
 
     strat_kwargs = _parse_strategy_params(params)
     console.print(f"[bold green]Dry mode: strategy={strategy}, coins={', '.join(coin_list)}[/]")
-    if strat_kwargs:
-        console.print(f"  params: {strat_kwargs}")
+    strat_instance = _print_strategy_params(strat_class, strat_kwargs)
 
     async def _run() -> None:
         await init_db()
@@ -90,7 +107,7 @@ def dry(strategy: str, coins: str | None, do_collect: bool, params: tuple[str, .
             orch = CollectionOrchestrator(coins=coin_list)
             orch.spot.start()
 
-        engine = ExecutionEngine(mode="dry", strategy=strat_class(**strat_kwargs), coins=coin_list)
+        engine = ExecutionEngine(mode="dry", strategy=strat_instance, coins=coin_list)
         try:
             await engine.run_dry()
         finally:
@@ -117,8 +134,7 @@ def shadow(strategy: str, coins: str | None, collect: bool, params: tuple[str, .
 
     strat_kwargs = _parse_strategy_params(params)
     console.print(f"[bold green]Shadow mode: strategy={strategy}, coins={', '.join(coin_list)}[/]")
-    if strat_kwargs:
-        console.print(f"  params: {strat_kwargs}")
+    strat_instance = _print_strategy_params(strat_class, strat_kwargs)
 
     async def _run() -> None:
         await init_db()
@@ -127,7 +143,7 @@ def shadow(strategy: str, coins: str | None, collect: bool, params: tuple[str, .
             orch = CollectionOrchestrator(coins=coin_list)
             await orch.run()
 
-        engine = ExecutionEngine(mode="shadow", strategy=strat_class(**strat_kwargs), coins=coin_list)
+        engine = ExecutionEngine(mode="shadow", strategy=strat_instance, coins=coin_list)
         try:
             await engine.run_shadow()
         except KeyboardInterrupt:
