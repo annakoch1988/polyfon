@@ -26,6 +26,13 @@ class Context:
     tau_seconds: Optional[float] = None
     sigma_per_minute: Optional[float] = None
     timestamp: Optional[datetime] = None
+    window_open_price: Optional[float] = None
+
+    # Token-specific book prices (resolves the UP/DOWN ambiguity).
+    up_best_bid: Optional[float] = None
+    up_best_ask: Optional[float] = None
+    down_best_bid: Optional[float] = None
+    down_best_ask: Optional[float] = None
 
 
 class BaseStrategy(ABC):
