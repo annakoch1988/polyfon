@@ -211,6 +211,12 @@ class CollectionOrchestrator:
                     )
                     self._discovered_windows[slug] = win
                     sess.add(win)
+                    console.print(
+                        f"  [cyan]DISCOVERED[/] {win.underlying} "
+                        f"{_fmt_et(win.start_et)}–{_fmt_et(win.end_et)}  "
+                        f"[dim]{win.slug}[/]  "
+                        f"[dim]https://polymarket.com/event/{win.slug}[/]"
+                    )
 
     @staticmethod
     def _naive_utc(dt: datetime) -> datetime:
