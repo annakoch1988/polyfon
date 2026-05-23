@@ -341,7 +341,50 @@ class CollectionOrchestrator:
         now = datetime.now(timezone.utc)
         now_n = self._naive_utc(now)
 
-        console.print("\n[bold cyan]Maintenance[/]")
+        # DB state summary
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window.underlying, Window.start_et, Window.status).where(
+                    Window.underlying.in_(self.coins)
+                )
+            )
+            rows = result.all()
+        if rows:
+            from collections import defaultdict
+            coins_data: dict = defaultdict(lambda: {"resolved": 0, "min": None, "max": None})
+            for underlying, start_et, status in rows:
+                d = coins_data[underlying]
+                if status == "resolved":
+                    d["resolved"] += 1
+                if d["min"] is None or start_et < d["min"]:
+                    d["min"] = start_et
+                if d["max"] is None or start_et > d["max"]:
+                    d["max"] = start_et
+            for coin, data in sorted(coins_data.items()):
+                total_min = data["resolved"] * 5
+                parts = []
+                if total_min >= 1440:
+                    days = total_min // 1440
+                    parts.append(f"{days}d")
+                    total_min %= 1440
+                if total_min >= 60:
+                    hours = total_min // 60
+                    parts.append(f"{hours}h")
+                    total_min %= 60
+                if total_min or not parts:
+                    parts.append(f"{total_min}m")
+                coverage = " ".join(parts)
+                date_range = (
+                    f"{data['min'].strftime('%b %d')}–{data['max'].strftime('%b %d')}"
+                    if data["min"] else "—"
+                )
+                console.print(
+                    f"  [bold]{coin}[/]: {data['resolved']} resolved windows "
+                    f"({coverage} total)  [dim]{date_range}[/]"
+                )
+        console.print()
+
+        console.print("[bold cyan]Maintenance[/]")
 
         # 1. Delete unfinished windows (pending + open) from other runs.
         removed = 0
