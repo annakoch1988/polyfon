@@ -1,7 +1,7 @@
 """Execution engine: runs strategies in dry or shadow mode."""
 import asyncio
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -29,6 +29,49 @@ class FillResult:
     eval_time: datetime
 
 
+@dataclass
+class WindowTradeSummary:
+    side: str
+    shares: float
+    entry_price: float
+    cost: float
+    resolution: str
+    settlement: float
+    revenue: float
+    fees: float
+    pnl: float
+    outcome: str
+
+
+@dataclass
+class DryWindowReport:
+    window_id: str
+    title: str
+    slug: str
+    underlying: str
+    window_label: str
+    link: str
+    status: str = "NO SIGNAL"
+    reason: Optional[str] = None
+    signal_direction: Optional[str] = None
+    signal_edge: Optional[float] = None
+    signal_confidence: Optional[float] = None
+    order_class: Optional[str] = None
+    order_desc: Optional[str] = None
+    signal_time: Optional[str] = None
+    trades: List[WindowTradeSummary] = field(default_factory=list)
+    resolution: Optional[str] = None
+    realized_pnl: float = 0.0
+
+
+def _window_label(window: Window) -> str:
+    return f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}"
+
+
+def _window_link(window: Window) -> str:
+    return f"https://polymarket.com/event/{window.slug}"
+
+
 class ExecutionEngine:
     """Orchestrate strategy execution for a given mode.
 
@@ -48,6 +91,68 @@ class ExecutionEngine:
         if symbol not in self._vols:
             self._vols[symbol] = RollingVolatility(window=60, interval_sec=1.0)
         return self._vols[symbol]
+
+    def _init_dry_report(self, window: Window) -> DryWindowReport:
+        return DryWindowReport(
+            window_id=window.id,
+            title=window.title,
+            slug=window.slug,
+            underlying=window.underlying,
+            window_label=_window_label(window),
+            link=_window_link(window),
+        )
+
+    def _render_dry_report(self, report: DryWindowReport, window_index: int, total_windows: int) -> None:
+        console = Console()
+        divider = "=" * 72
+        console.print(divider)
+        console.print(f"[bold]Window {window_index}/{total_windows}[/]")
+        console.print(f"[bold]{report.underlying} {report.window_label}[/]")
+        console.print(f"Slug: {report.slug}")
+        console.print(f"Title: {report.title}")
+        console.print(f"Link: {report.link}")
+        console.print("-" * 72)
+        console.print(f"Status: {report.status}")
+
+        if report.reason:
+            console.print(f"Reason: {report.reason}")
+
+        if report.signal_direction:
+            console.print(f"Action: {report.signal_direction}")
+            console.print("Signal:")
+            if report.signal_edge is not None:
+                console.print(f"  edge: {report.signal_edge:.4f}")
+            if report.signal_confidence is not None:
+                console.print(f"  conf: {report.signal_confidence:.4f}")
+            if report.order_desc:
+                console.print(f"  {report.order_desc}")
+            if report.signal_time:
+                console.print(f"  timestamp: {report.signal_time}")
+
+        for trade in report.trades:
+            console.print("")
+            console.print("Trade:")
+            console.print(f"  side: {trade.side}")
+            console.print(f"  shares: {trade.shares:.4f}")
+            console.print(f"  entry: {trade.entry_price:.4f}")
+            console.print(f"  cost: {trade.cost:.4f}")
+            console.print("")
+            console.print("Settlement:")
+            console.print(f"  resolution: {trade.resolution}")
+            console.print(f"  settlement: {trade.settlement:.4f}")
+            console.print(f"  revenue: {trade.revenue:.4f}")
+            console.print(f"  fees: {trade.fees:.5f}")
+            console.print(f"  pnl: {trade.pnl:.4f}")
+            console.print(f"  outcome: {trade.outcome}")
+
+        console.print("")
+        console.print("Result:")
+        if report.trades:
+            console.print(f"  Trades: {len(report.trades)}")
+        else:
+            console.print("  No fills")
+        console.print(f"  Realized PnL: {report.realized_pnl:.4f}")
+        console.print(divider)
 
     @staticmethod
     def _normalize_outcome(outcome: Optional[str]) -> Optional[str]:
@@ -304,21 +409,17 @@ class ExecutionEngine:
         if signal:
             await self._on_signal(window, signal)
 
-    async def _check_dry_window(self, window: Window) -> None:
+    async def _check_dry_window(self, window: Window) -> DryWindowReport:
         """Run strategy on a historical window using its replay plan."""
-        console = Console()
+        report = self._init_dry_report(window)
         plan = self.strategy.build_replay_plan(window)
         if not isinstance(plan, ReplayPlan) or not plan.eval_times:
-            console.print(
-                f"  [dim]SKIP[/]  {window.underlying} "
-                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')} "
-                f"[dim]no replay plan[/]"
-            )
-            return
+            report.reason = "no replay plan"
+            return report
 
         for eval_time in plan.eval_times:
             if not self._running:
-                return
+                return report
             ctx = await self._build_context(window, eval_time=eval_time)
             signal = self.strategy.on_tick(window, ctx)
             if not signal:
@@ -333,35 +434,25 @@ class ExecutionEngine:
                 if order_class == "limit"
                 else "order=unfilled"
             )
-            console.print(
-                f"  [yellow]SIGNAL[/] {window.underlying} "
-                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  "
-                f"slug={window.slug}  "
-                f"[bold]{signal.direction}[/] "
-                f"edge={signal.expected_edge:.4f}  "
-                f"conf={signal.confidence:.3f}  "
-                f"{order_desc}  "
-                f"[dim]at {eval_time.strftime('%H:%M:%S')}[/]"
-            )
+            report.status = "SIGNAL"
+            report.reason = None
+            report.signal_direction = signal.direction
+            report.signal_edge = signal.expected_edge
+            report.signal_confidence = signal.confidence
+            report.order_class = order_class
+            report.order_desc = order_desc
+            report.signal_time = eval_time.strftime('%H:%M:%S')
             if plan.stop_on_signal:
-                return
+                return report
 
-        console.print(
-            f"  [dim]SKIP[/]  {window.underlying} "
-            f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
-            f"[dim]no signal[/]"
-        )
+        report.reason = "no signal"
+        return report
 
-    async def _finalize_dry_window(self, window: Window) -> List[float]:
+    async def _finalize_dry_window(self, window: Window, report: DryWindowReport) -> List[float]:
         """Resolve and print realized PnL for one historical window."""
-        console = Console()
         outcome = self._normalize_outcome(window.outcome)
         if outcome is None:
-            console.print(
-                f"  [dim]PNL[/]    {window.underlying} "
-                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
-                f"[dim]unresolved window[/]"
-            )
+            report.reason = "unresolved window"
             return []
 
         realized_pnls: List[float] = []
@@ -401,28 +492,26 @@ class ExecutionEngine:
                 realized_pnls.append(pnl_value)
                 resolution_label = "YES" if outcome == "YES" else "NO"
                 win_label = "won" if outcome_hit else "lost"
-                console.print(
-                    f"  [cyan]TRADE[/]  {window.underlying} "
-                    f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug}  "
-                    f"side={pos.side}  shares={pos.size:.4f}  entry={pos.entry_price:.4f}  "
-                    f"cost={cost:.4f}  resolution={resolution_label}  settlement={exit_price:.4f}  "
-                    f"revenue={revenue:.4f}  fees={pos.fees_paid + exit_fee:.5f}  pnl={pnl_value:.4f}  {win_label}"
+                report.trades.append(
+                    WindowTradeSummary(
+                        side=pos.side,
+                        shares=pos.size,
+                        entry_price=pos.entry_price,
+                        cost=cost,
+                        resolution=resolution_label,
+                        settlement=exit_price,
+                        revenue=revenue,
+                        fees=pos.fees_paid + exit_fee,
+                        pnl=pnl_value,
+                        outcome=win_label,
+                    )
                 )
 
         if realized_pnls:
-            window_total = sum(realized_pnls)
-            color = "green" if window_total >= 0 else "red"
-            console.print(
-                f"  [{color}]PNL[/]    {window.underlying} "
-                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
-                f"resolution={outcome}  realized={window_total:.4f}  trades={len(realized_pnls)}"
-            )
+            report.resolution = outcome
+            report.realized_pnl = sum(realized_pnls)
         else:
-            console.print(
-                f"  [dim]PNL[/]    {window.underlying} "
-                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
-                f"[dim]no fills[/]"
-            )
+            report.resolution = outcome
 
         return realized_pnls
 
@@ -445,20 +534,23 @@ class ExecutionEngine:
         console = Console()
         console.print(f"[bold cyan]Dry run: {len(windows)} historical windows[/]")
 
+        reports: List[DryWindowReport] = []
         for w in windows:
             if not self._running:
                 break
-            await self._check_dry_window(w)
+            reports.append(await self._check_dry_window(w))
 
         total_pnl = 0.0
         any_realized = False
-        for w in windows:
+        for idx, w in enumerate(windows, start=1):
             if not self._running:
                 break
-            realized_pnls = await self._finalize_dry_window(w)
+            report = next((r for r in reports if r.window_id == w.id), self._init_dry_report(w))
+            realized_pnls = await self._finalize_dry_window(w, report)
             if realized_pnls:
                 any_realized = True
                 total_pnl += sum(realized_pnls)
+            self._render_dry_report(report, idx, len(windows))
 
         if self._running:
             if any_realized:
