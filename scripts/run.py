@@ -19,6 +19,12 @@ def _parse_coins(coins_str: str) -> list[str]:
     return [c.strip().upper() for c in coins_str.split(",") if c.strip()]
 
 
+def _parse_csv_strings(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _parse_strategy_params(params: tuple[str, ...]) -> dict:
     """Parse ``key=value`` strings into a typed dict for strategy kwargs."""
     kwargs = {}
@@ -94,6 +100,7 @@ def collect(coins: str | None) -> None:
 @cli.command()
 @click.option("--strategy", required=True, help="Strategy name to run (e.g., SLA).")
 @click.option("--coins", default=None, help="Comma-separated coin list filter.")
+@click.option("--window-slugs", default=None, help="Comma-separated window slugs to restrict execution.")
 @click.option("--collect", "do_collect", is_flag=True, help="Also run data collection in parallel.")
 @click.option(
     "--replay-cadence-seconds",
@@ -105,12 +112,14 @@ def collect(coins: str | None) -> None:
 def dry(
     strategy: str,
     coins: str | None,
+    window_slugs: str | None,
     do_collect: bool,
     replay_cadence_seconds: float | None,
     params: tuple[str, ...],
 ) -> None:
     """Run dry mode: simulate strategy on historical DB data."""
     coin_list = _parse_coins(coins) if coins else settings.coin_list
+    slug_list = _parse_csv_strings(window_slugs)
     strat_class = StrategyRegistry.get(strategy)
     if strat_class is None:
         available = ", ".join(StrategyRegistry.list_strategies())
@@ -120,7 +129,10 @@ def dry(
     strat_kwargs = _parse_strategy_params(params)
     if replay_cadence_seconds is not None:
         strat_kwargs["replay_cadence_seconds"] = replay_cadence_seconds
-    console.print(f"[bold green]Dry mode: strategy={strategy}, coins={', '.join(coin_list)}[/]")
+    scope_bits = [f"strategy={strategy}", f"coins={', '.join(coin_list)}"]
+    if slug_list:
+        scope_bits.append(f"window_slugs={', '.join(slug_list)}")
+    console.print(f"[bold green]Dry mode: {' | '.join(scope_bits)}[/]")
     strat_instance = _print_strategy_params(strat_class, strat_kwargs)
 
     async def _run() -> None:
@@ -130,7 +142,7 @@ def dry(
             orch = CollectionOrchestrator(coins=coin_list)
             orch.spot.start()
 
-        engine = ExecutionEngine(mode="dry", strategy=strat_instance, coins=coin_list)
+        engine = ExecutionEngine(mode="dry", strategy=strat_instance, coins=coin_list, window_slugs=slug_list)
         try:
             await engine.run_dry()
         except asyncio.CancelledError:

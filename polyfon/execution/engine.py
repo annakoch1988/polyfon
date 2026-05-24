@@ -1,6 +1,7 @@
 """Execution engine: runs strategies in dry or shadow mode."""
 import asyncio
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -12,7 +13,20 @@ from polyfon.models import Window, OrderBook, SpotPrice, Position, TradeSignal
 from polyfon.strategies.base import BaseStrategy, Context, ReplayPlan, Signal
 from polyfon.pricing.fair_probability import fair_probability
 from polyfon.pricing.volatility import RollingVolatility
-from polyfon.utils.fees import taker_fee_usdc
+from polyfon.utils.fees import net_pnl, taker_fee_usdc
+
+
+@dataclass
+class FillResult:
+    position_id: str
+    order_class: str
+    side: str
+    shares: float
+    entry_price: float
+    notional: float
+    entry_fee: float
+    total_cost: float
+    eval_time: datetime
 
 
 class ExecutionEngine:
@@ -22,10 +36,11 @@ class ExecutionEngine:
     Shadow mode: runs in real-time with simulated fills.
     """
 
-    def __init__(self, mode: str, strategy: BaseStrategy, coins: Optional[List[str]] = None):
+    def __init__(self, mode: str, strategy: BaseStrategy, coins: Optional[List[str]] = None, window_slugs: Optional[List[str]] = None):
         self.mode = mode
         self.strategy = strategy
         self.coins = coins or []
+        self.window_slugs = window_slugs or []
         self._running = False
         self._vols: Dict[str, RollingVolatility] = {}
 
@@ -33,6 +48,17 @@ class ExecutionEngine:
         if symbol not in self._vols:
             self._vols[symbol] = RollingVolatility(window=60, interval_sec=1.0)
         return self._vols[symbol]
+
+    @staticmethod
+    def _normalize_outcome(outcome: Optional[str]) -> Optional[str]:
+        if outcome is None:
+            return None
+        normalized = outcome.strip().upper()
+        if normalized in {"YES", "UP"}:
+            return "YES"
+        if normalized in {"NO", "DOWN"}:
+            return "NO"
+        return normalized
 
     async def _build_context(self, window: Window, eval_time: Optional[datetime] = None) -> Context:
         """Build execution context for a window.
@@ -157,7 +183,7 @@ class ExecutionEngine:
 
         return ctx
 
-    async def _on_signal(self, window: Window, signal: Signal, eval_time: Optional[datetime] = None) -> None:
+    async def _on_signal(self, window: Window, signal: Signal, eval_time: Optional[datetime] = None) -> Optional[FillResult]:
         """Handle a strategy signal: log it, and simulate a position if dry/shadow."""
         async with session_scope() as sess:
             ts = TradeSignal(
@@ -173,9 +199,10 @@ class ExecutionEngine:
             sess.add(ts)
 
         if self.mode in ("dry", "shadow"):
-            await self._simulate_fill(window, signal, eval_time=eval_time)
+            return await self._simulate_fill(window, signal, eval_time=eval_time)
+        return None
 
-    async def _simulate_fill(self, window: Window, signal: Signal, eval_time: Optional[datetime] = None) -> None:
+    async def _simulate_fill(self, window: Window, signal: Signal, eval_time: Optional[datetime] = None) -> Optional[FillResult]:
         """Simulate a fill at the best bid/ask.
 
         For historical replay (eval_time set), uses the latest book at
@@ -190,7 +217,7 @@ class ExecutionEngine:
         }
         token_id, field = token_map.get(signal.direction, (None, None))
         if token_id is None:
-            return
+            return None
 
         price = None
         async with session_scope() as sess:
@@ -211,10 +238,19 @@ class ExecutionEngine:
                 price = getattr(ob, field, None)
 
         if price is None:
-            return
+            return None
 
-        if signal.size < 5 or signal.size * price < 1.0:
-            return
+        order_class = "market"
+        if signal.metadata:
+            order_class = str(signal.metadata.get("order_class", "market")).lower()
+
+        notional = signal.size * price
+        if order_class == "limit":
+            if signal.size < 5 or notional < 1.0:
+                return None
+        else:
+            if notional < 1.0:
+                return None
 
         fee_rate = window.fee_rate or 0.07
         fee = taker_fee_usdc(signal.size, price, fee_rate)
@@ -227,8 +263,10 @@ class ExecutionEngine:
         }
 
         async with session_scope() as sess:
+            position_id = str(uuid.uuid4())
+            opened_at = eval_time or datetime.now(timezone.utc)
             pos = Position(
-                id=str(uuid.uuid4()),
+                id=position_id,
                 mode=self.mode,
                 window_id=window.id,
                 strategy=signal.strategy,
@@ -237,9 +275,21 @@ class ExecutionEngine:
                 size=signal.size,
                 fees_paid=fee,
                 status="open",
-                opened_at=datetime.now(timezone.utc),
+                opened_at=opened_at,
             )
             sess.add(pos)
+
+        return FillResult(
+            position_id=position_id,
+            order_class=order_class,
+            side=side_map.get(signal.direction, "LONG_YES"),
+            shares=signal.size,
+            entry_price=price,
+            notional=notional,
+            entry_fee=fee,
+            total_cost=notional + fee,
+            eval_time=eval_time or datetime.now(timezone.utc),
+        )
 
     async def _check_window(self, window_id: str) -> None:
         """Run strategy on a single open window (live / shadow mode)."""
@@ -274,7 +324,15 @@ class ExecutionEngine:
             if not signal:
                 continue
 
-            await self._on_signal(window, signal, eval_time=eval_time)
+            fill = await self._on_signal(window, signal, eval_time=eval_time)
+            order_class = str((signal.metadata or {}).get("order_class", "market")).lower()
+            order_desc = (
+                f"order=market spend={fill.notional:.4f} shares={fill.shares:.4f} fee={fill.entry_fee:.5f} total_cost={fill.total_cost:.4f}"
+                if fill and order_class == "market"
+                else f"order=limit shares={signal.size:.4f} notional={((signal.metadata or {}).get('notional', 0.0)):.4f}"
+                if order_class == "limit"
+                else "order=unfilled"
+            )
             console.print(
                 f"  [yellow]SIGNAL[/] {window.underlying} "
                 f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  "
@@ -282,6 +340,7 @@ class ExecutionEngine:
                 f"[bold]{signal.direction}[/] "
                 f"edge={signal.expected_edge:.4f}  "
                 f"conf={signal.confidence:.3f}  "
+                f"{order_desc}  "
                 f"[dim]at {eval_time.strftime('%H:%M:%S')}[/]"
             )
             if plan.stop_on_signal:
@@ -292,6 +351,80 @@ class ExecutionEngine:
             f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
             f"[dim]no signal[/]"
         )
+
+    async def _finalize_dry_window(self, window: Window) -> List[float]:
+        """Resolve and print realized PnL for one historical window."""
+        console = Console()
+        outcome = self._normalize_outcome(window.outcome)
+        if outcome is None:
+            console.print(
+                f"  [dim]PNL[/]    {window.underlying} "
+                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
+                f"[dim]unresolved window[/]"
+            )
+            return []
+
+        realized_pnls: List[float] = []
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Position)
+                .where(
+                    Position.mode == "dry",
+                    Position.window_id == window.id,
+                    Position.status == "open",
+                )
+                .order_by(Position.opened_at)
+            )
+            positions = result.scalars().all()
+
+            for pos in positions:
+                outcome_hit = (
+                    (outcome == "YES" and pos.side == "LONG_YES")
+                    or (outcome == "NO" and pos.side == "LONG_NO")
+                )
+                exit_price = 1.0 if outcome_hit else 0.0
+                fee_rate = window.fee_rate or 0.07
+                pnl_value = net_pnl(
+                    pos.size,
+                    pos.entry_price,
+                    exit_price,
+                    fee_rate,
+                    fee_rate,
+                )
+                revenue = pos.size * exit_price
+                cost = pos.size * pos.entry_price + taker_fee_usdc(pos.size, pos.entry_price, fee_rate)
+                exit_fee = taker_fee_usdc(pos.size, exit_price, fee_rate)
+                pos.exit_price = exit_price
+                pos.pnl = pnl_value
+                pos.status = "closed"
+                pos.closed_at = datetime.now(timezone.utc)
+                realized_pnls.append(pnl_value)
+                resolution_label = "YES" if outcome == "YES" else "NO"
+                win_label = "won" if outcome_hit else "lost"
+                console.print(
+                    f"  [cyan]TRADE[/]  {window.underlying} "
+                    f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug}  "
+                    f"side={pos.side}  shares={pos.size:.4f}  entry={pos.entry_price:.4f}  "
+                    f"cost={cost:.4f}  resolution={resolution_label}  settlement={exit_price:.4f}  "
+                    f"revenue={revenue:.4f}  fees={pos.fees_paid + exit_fee:.5f}  pnl={pnl_value:.4f}  {win_label}"
+                )
+
+        if realized_pnls:
+            window_total = sum(realized_pnls)
+            color = "green" if window_total >= 0 else "red"
+            console.print(
+                f"  [{color}]PNL[/]    {window.underlying} "
+                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
+                f"resolution={outcome}  realized={window_total:.4f}  trades={len(realized_pnls)}"
+            )
+        else:
+            console.print(
+                f"  [dim]PNL[/]    {window.underlying} "
+                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
+                f"[dim]no fills[/]"
+            )
+
+        return realized_pnls
 
     # ---- public API ----------------------------------------------------------
 
@@ -304,6 +437,8 @@ class ExecutionEngine:
             )
             if self.coins:
                 query = query.where(Window.underlying.in_(self.coins))
+            if self.window_slugs:
+                query = query.where(Window.slug.in_(self.window_slugs))
             result = await sess.execute(query)
             windows = result.scalars().all()
 
@@ -315,40 +450,22 @@ class ExecutionEngine:
                 break
             await self._check_dry_window(w)
 
-        # Compute realized PnL for resolved windows with simulated positions
-        from polyfon.utils.fees import net_pnl
-
         total_pnl = 0.0
-        realized = []
-        async with session_scope() as sess:
-            result = await sess.execute(
-                select(Position, Window)
-                .join(Window, Position.window_id == Window.id)
-                .where(Position.mode == "dry")
-            )
-            for pos, win in result.all():
-                if not win.outcome:
-                    continue
-                outcome_hit = (
-                    (win.outcome == "YES" and pos.side == "LONG_YES")
-                    or (win.outcome == "NO" and pos.side == "LONG_NO")
-                )
-                pnl_value = net_pnl(
-                    pos.entry_price,
-                    1.0 if outcome_hit else 0.0,
-                    pos.size,
-                    win.fee_rate or 0.07,
-                )
-                realized.append((win.underlying, win.start_et, pnl_value))
-                total_pnl += pnl_value
+        any_realized = False
+        for w in windows:
+            if not self._running:
+                break
+            realized_pnls = await self._finalize_dry_window(w)
+            if realized_pnls:
+                any_realized = True
+                total_pnl += sum(realized_pnls)
 
-        if realized:
-            console.print("\n[bold cyan]Realized PnL summary:[/]")
-            for sym, start, pnl in realized:
-                console.print(f"  {sym} {start.strftime('%H:%M')}  PnL = {pnl:.4f}")
-            console.print(f"[bold green]Total realized PnL: {total_pnl:.4f}[/]")
-        else:
-            console.print("[dim]No realized PnL (no signals or unresolved windows).[/]")
+        if self._running:
+            if any_realized:
+                color = "green" if total_pnl >= 0 else "red"
+                console.print(f"[bold {color}]Total realized PnL: {total_pnl:.4f}[/]")
+            else:
+                console.print("[dim]No realized PnL (no fills or unresolved windows).[/]")
 
         console.print("[bold green]Dry run complete.[/]")
 
