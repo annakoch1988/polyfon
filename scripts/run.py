@@ -95,8 +95,20 @@ def collect(coins: str | None) -> None:
 @click.option("--strategy", required=True, help="Strategy name to run (e.g., SLA).")
 @click.option("--coins", default=None, help="Comma-separated coin list filter.")
 @click.option("--collect", "do_collect", is_flag=True, help="Also run data collection in parallel.")
+@click.option(
+    "--replay-cadence-seconds",
+    type=float,
+    default=None,
+    help="Convenience override for strategy replay_cadence_seconds in dry mode.",
+)
 @click.option("--param", "params", multiple=True, help="Strategy parameter as key=value (repeatable).")
-def dry(strategy: str, coins: str | None, do_collect: bool, params: tuple[str, ...]) -> None:
+def dry(
+    strategy: str,
+    coins: str | None,
+    do_collect: bool,
+    replay_cadence_seconds: float | None,
+    params: tuple[str, ...],
+) -> None:
     """Run dry mode: simulate strategy on historical DB data."""
     coin_list = _parse_coins(coins) if coins else settings.coin_list
     strat_class = StrategyRegistry.get(strategy)
@@ -106,6 +118,8 @@ def dry(strategy: str, coins: str | None, do_collect: bool, params: tuple[str, .
         raise click.BadParameter(f"strategy must be one of: {available}")
 
     strat_kwargs = _parse_strategy_params(params)
+    if replay_cadence_seconds is not None:
+        strat_kwargs["replay_cadence_seconds"] = replay_cadence_seconds
     console.print(f"[bold green]Dry mode: strategy={strategy}, coins={', '.join(coin_list)}[/]")
     strat_instance = _print_strategy_params(strat_class, strat_kwargs)
 
@@ -134,8 +148,20 @@ def dry(strategy: str, coins: str | None, do_collect: bool, params: tuple[str, .
 @click.option("--strategy", required=True, help="Strategy name to run.")
 @click.option("--coins", default=None, help="Comma-separated coin list.")
 @click.option("--collect", is_flag=True, help="Also run collection in parallel.")
+@click.option(
+    "--replay-cadence-seconds",
+    type=float,
+    default=None,
+    help="Convenience override for strategy replay_cadence_seconds in shadow/dry-compatible strategies.",
+)
 @click.option("--param", "params", multiple=True, help="Strategy parameter as key=value (repeatable).")
-def shadow(strategy: str, coins: str | None, collect: bool, params: tuple[str, ...]) -> None:
+def shadow(
+    strategy: str,
+    coins: str | None,
+    collect: bool,
+    replay_cadence_seconds: float | None,
+    params: tuple[str, ...],
+) -> None:
     """Run shadow mode: real-time simulated trading."""
     coin_list = _parse_coins(coins) if coins else settings.coin_list
     strat_class = StrategyRegistry.get(strategy)
@@ -145,6 +171,8 @@ def shadow(strategy: str, coins: str | None, collect: bool, params: tuple[str, .
         raise click.BadParameter(f"strategy must be one of: {available}")
 
     strat_kwargs = _parse_strategy_params(params)
+    if replay_cadence_seconds is not None:
+        strat_kwargs["replay_cadence_seconds"] = replay_cadence_seconds
     console.print(f"[bold green]Shadow mode: strategy={strategy}, coins={', '.join(coin_list)}[/]")
     strat_instance = _print_strategy_params(strat_class, strat_kwargs)
 

@@ -278,6 +278,7 @@ class ExecutionEngine:
             console.print(
                 f"  [yellow]SIGNAL[/] {window.underlying} "
                 f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  "
+                f"slug={window.slug}  "
                 f"[bold]{signal.direction}[/] "
                 f"edge={signal.expected_edge:.4f}  "
                 f"conf={signal.confidence:.3f}  "
@@ -288,7 +289,7 @@ class ExecutionEngine:
 
         console.print(
             f"  [dim]SKIP[/]  {window.underlying} "
-            f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')} "
+            f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  slug={window.slug} "
             f"[dim]no signal[/]"
         )
 
@@ -313,6 +314,41 @@ class ExecutionEngine:
             if not self._running:
                 break
             await self._check_dry_window(w)
+
+        # Compute realized PnL for resolved windows with simulated positions
+        from polyfon.utils.fees import net_pnl
+
+        total_pnl = 0.0
+        realized = []
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Position, Window)
+                .join(Window, Position.window_id == Window.id)
+                .where(Position.mode == "dry")
+            )
+            for pos, win in result.all():
+                if not win.outcome:
+                    continue
+                outcome_hit = (
+                    (win.outcome == "YES" and pos.side == "LONG_YES")
+                    or (win.outcome == "NO" and pos.side == "LONG_NO")
+                )
+                pnl_value = net_pnl(
+                    pos.entry_price,
+                    1.0 if outcome_hit else 0.0,
+                    pos.size,
+                    win.fee_rate or 0.07,
+                )
+                realized.append((win.underlying, win.start_et, pnl_value))
+                total_pnl += pnl_value
+
+        if realized:
+            console.print("\n[bold cyan]Realized PnL summary:[/]")
+            for sym, start, pnl in realized:
+                console.print(f"  {sym} {start.strftime('%H:%M')}  PnL = {pnl:.4f}")
+            console.print(f"[bold green]Total realized PnL: {total_pnl:.4f}[/]")
+        else:
+            console.print("[dim]No realized PnL (no signals or unresolved windows).[/]")
 
         console.print("[bold green]Dry run complete.[/]")
 
