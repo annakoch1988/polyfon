@@ -1,8 +1,8 @@
 """Base strategy interface and registry."""
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -28,11 +28,24 @@ class Context:
     timestamp: Optional[datetime] = None
     window_open_price: Optional[float] = None
 
+    # Intra-window spot range (for range-break strategies like ROM).
+    range_high: Optional[float] = None
+    range_low: Optional[float] = None
+
     # Token-specific book prices (resolves the UP/DOWN ambiguity).
     up_best_bid: Optional[float] = None
     up_best_ask: Optional[float] = None
     down_best_bid: Optional[float] = None
     down_best_ask: Optional[float] = None
+
+
+@dataclass
+class ReplayPlan:
+    """Strategy-owned historical replay schedule for one window."""
+
+    eval_times: List[datetime] = field(default_factory=list)
+    stop_on_signal: bool = True
+    cadence_seconds: float = 1.0
 
 
 class BaseStrategy(ABC):
@@ -49,6 +62,14 @@ class BaseStrategy(ABC):
     def on_window_close(self, window: Any, context: Context) -> Optional[Signal]:
         """Called when a window closes (just before resolution)."""
         ...
+
+    def build_replay_plan(self, window: Any) -> ReplayPlan:
+        """Return the historical evaluation schedule for this strategy/window.
+
+        Default behavior preserves the previous dry-mode semantics: evaluate
+        once at T-10s.
+        """
+        return ReplayPlan(eval_times=[window.end_et - timedelta(seconds=10)])
 
 
 class StrategyRegistry:

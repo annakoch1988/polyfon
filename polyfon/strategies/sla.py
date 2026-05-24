@@ -1,7 +1,8 @@
 """Strategy 1: Spot-Led Latency Arbitrage (SLA)."""
+from datetime import timedelta
 from typing import Any, Optional
 
-from polyfon.strategies.base import BaseStrategy, Context, Signal, register
+from polyfon.strategies.base import BaseStrategy, Context, ReplayPlan, Signal, register
 from polyfon.utils.fees import taker_fee_usdc
 
 
@@ -30,6 +31,7 @@ class SLAStrategy(BaseStrategy):
         self,
         theta_entry: float = 0.05,
         tau_min: float = 30.0,
+        replay_cadence_seconds: float = 1.0,
         q_max: float = 100.0,
         order_class: str = "limit",
         time_in_force: str = "GTC",
@@ -45,6 +47,7 @@ class SLAStrategy(BaseStrategy):
             )
         self.theta_entry = theta_entry
         self.tau_min = tau_min
+        self.replay_cadence_seconds = replay_cadence_seconds
         self.q_max = q_max
         self.order_class = order_class
         self.time_in_force = time_in_force
@@ -126,6 +129,20 @@ class SLAStrategy(BaseStrategy):
                 )
 
         return None
+
+    def build_replay_plan(self, window: Any) -> ReplayPlan:
+        latest = window.end_et - timedelta(seconds=self.tau_min)
+        if latest <= window.start_et:
+            return ReplayPlan(eval_times=[])
+        if self.replay_cadence_seconds <= 0:
+            raise ValueError("replay_cadence_seconds must be > 0")
+        eval_times = []
+        current = window.start_et
+        step = timedelta(seconds=self.replay_cadence_seconds)
+        while current <= latest:
+            eval_times.append(current)
+            current += step
+        return ReplayPlan(eval_times=eval_times, stop_on_signal=True, cadence_seconds=self.replay_cadence_seconds)
 
     def on_window_close(self, window: Any, context: Context) -> Optional[Signal]:
         return None

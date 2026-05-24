@@ -1,15 +1,15 @@
 """Execution engine: runs strategies in dry or shadow mode."""
 import asyncio
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from rich.console import Console
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, func
 
 from polyfon.database import session_scope
 from polyfon.models import Window, OrderBook, SpotPrice, Position, TradeSignal
-from polyfon.strategies.base import BaseStrategy, Context, Signal
+from polyfon.strategies.base import BaseStrategy, Context, ReplayPlan, Signal
 from polyfon.pricing.fair_probability import fair_probability
 from polyfon.pricing.volatility import RollingVolatility
 from polyfon.utils.fees import taker_fee_usdc
@@ -74,7 +74,7 @@ class ExecutionEngine:
                 ctx.sigma_per_minute = vol.sigma_per_minute
 
         async with session_scope() as sess:
-            result = await sess.execute(
+            spot_q = (
                 select(SpotPrice)
                 .where(
                     SpotPrice.symbol == symbol,
@@ -82,11 +82,25 @@ class ExecutionEngine:
                     SpotPrice.timestamp <= now,
                 )
                 .order_by(SpotPrice.timestamp)
-                .limit(1)
             )
+            result = await sess.execute(spot_q.limit(1))
             sp_open = result.scalar_one_or_none()
             if sp_open:
                 ctx.window_open_price = sp_open.price
+
+            # Range high/low within the window (for ROM).
+            range_result = await sess.execute(
+                select(func.max(SpotPrice.price), func.min(SpotPrice.price))
+                .where(
+                    SpotPrice.symbol == symbol,
+                    SpotPrice.timestamp >= window.start_et,
+                    SpotPrice.timestamp <= now,
+                )
+            )
+            row = range_result.one_or_none()
+            if row and row[0] is not None:
+                ctx.range_high = row[0]
+                ctx.range_low = row[1]
 
         # Order books at or before eval_time for historical alignment.
         async with session_scope() as sess:
@@ -241,32 +255,47 @@ class ExecutionEngine:
             await self._on_signal(window, signal)
 
     async def _check_dry_window(self, window: Window) -> None:
-        """Run strategy on a historical window with T-10s evaluation."""
-        eval_time = window.end_et - timedelta(seconds=10)
-        ctx = await self._build_context(window, eval_time=eval_time)
-        signal = self.strategy.on_tick(window, ctx)
-        if signal:
+        """Run strategy on a historical window using its replay plan."""
+        console = Console()
+        plan = self.strategy.build_replay_plan(window)
+        if not isinstance(plan, ReplayPlan) or not plan.eval_times:
+            console.print(
+                f"  [dim]SKIP[/]  {window.underlying} "
+                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')} "
+                f"[dim]no replay plan[/]"
+            )
+            return
+
+        for eval_time in plan.eval_times:
+            if not self._running:
+                return
+            ctx = await self._build_context(window, eval_time=eval_time)
+            signal = self.strategy.on_tick(window, ctx)
+            if not signal:
+                continue
+
             await self._on_signal(window, signal, eval_time=eval_time)
-            console = Console()
             console.print(
                 f"  [yellow]SIGNAL[/] {window.underlying} "
                 f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')}  "
                 f"[bold]{signal.direction}[/] "
                 f"edge={signal.expected_edge:.4f}  "
-                f"conf={signal.confidence:.3f}"
+                f"conf={signal.confidence:.3f}  "
+                f"[dim]at {eval_time.strftime('%H:%M:%S')}[/]"
             )
-        else:
-            console = Console()
-            console.print(
-                f"  [dim]SKIP[/]  {window.underlying} "
-                f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')} "
-                f"[dim]no signal[/]"
-            )
+            if plan.stop_on_signal:
+                return
+
+        console.print(
+            f"  [dim]SKIP[/]  {window.underlying} "
+            f"{window.start_et.strftime('%H:%M')}–{window.end_et.strftime('%H:%M')} "
+            f"[dim]no signal[/]"
+        )
 
     # ---- public API ----------------------------------------------------------
 
     async def run_dry(self) -> None:
-        """Dry mode: replay historical windows from DB at T-10s."""
+        """Dry mode: replay historical windows from DB using strategy plans."""
         self._running = True
         async with session_scope() as sess:
             query = select(Window).where(

@@ -120,6 +120,7 @@ Both must be non-zero for the signal to fire. The product naturally down-weights
 | `theta_entry` | 0.05 | Step 4 | Minimum |fair_prob - market_price| to allow entry. Lower → more trades, lower average edge. | Grid search [0.03, 0.10]. |
 | `tau_max` | 90.0 s | Step 1 | Upper bound on entry timing: τ <= tau_max. Higher → more entry windows, but theta is smaller → lower edge. | Test 60, 90, 120. |
 | `tau_min` | 15.0 s | Step 1 | Lower bound on entry timing: τ >= tau_min. Lower → risk of vanishing liquidity. | Test 10, 15, 20. |
+| `replay_cadence_seconds` | 1.0 s | Dry replay | Historical evaluation spacing inside the `[tau_min, tau_max]` band. Lower = more faithful replay, higher = faster replay. | Test 1, 2, 5. |
 | `epsilon_sat` | 0.15 | Step 6 | Mispricing at which level-confidence saturates. | Set based on historical mispricing distribution. |
 | `theta_sat` | 0.005 | Step 6 | Theta magnitude at which rate-confidence saturates. | Set based on typical theta values at entry: plot theta across windows. |
 | `q_max` | 1.0 | Step 4 | Market: USDC to spend. Limit: shares to buy. | Fraction of bankroll. Conservative: $1. |
@@ -140,6 +141,10 @@ python -m scripts.run dry --strategy=TDE
 python -m scripts.run dry --strategy=TDE \
   --param tau_max=60 \
   --param theta_entry=0.04
+
+# Faster replay scan in dry mode
+python -m scripts.run dry --strategy=TDE \
+  --param replay_cadence_seconds=5
 
 # Higher conviction, larger size
 python -m scripts.run dry --strategy=TDE \

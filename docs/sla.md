@@ -105,6 +105,7 @@ Fee: `fee = shares * fee_rate * price * (1 - price)` per Polymarket docs.
 |-------|---------|---------|--------|
 | `theta_entry` | 0.05 | Step 6 | Minimum `|fair_prob - market_price|` to enter. Lower = more frequent trades but lower average edge. |
 | `tau_min` | 30.0 s | Step 1 | Minimum seconds before resolution to allow entry. Higher = more convergence time, but fewer entry windows. |
+| `replay_cadence_seconds` | 1.0 s | Dry replay | Historical evaluation spacing in dry mode. `1.0` = check every second from window open until `tau_min`; larger values speed up replay but can miss short-lived opportunities. |
 | `q_max` | 100 | Step 5–6 | Market: USDC to spend. Limit: shares to buy. |
 | `order_class` | `"limit"` | Step 5 | `"limit"` → rest on book (price improvement). `"market"` → immediate fill. |
 | `time_in_force` | `"GTC"` | Step 5 | `"GTC"` = good-til-cancelled. `"GTD"` = good-til-date. `"FOK"`/`"FAK"` = market. |
@@ -121,7 +122,15 @@ python -m scripts.run dry --strategy=SLA
 # Lower threshold, longer convergence time
 python -m scripts.run dry --strategy=SLA \
   --param theta_entry=0.03 \
+
+# Faster replay scan in dry mode
+python -m scripts.run dry --strategy=SLA \
+  --param replay_cadence_seconds=5
   --param tau_min=45
+
+# Faster historical replay with 5-second evaluation spacing
+python -m scripts.run dry --strategy=SLA \
+  --param replay_cadence_seconds=5
 
 # Larger position
 python -m scripts.run dry --strategy=SLA \

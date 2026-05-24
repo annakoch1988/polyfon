@@ -1,10 +1,11 @@
 """Strategy: Time Decay Effect (TDE)."""
 import math
+from datetime import timedelta
 from typing import Any, Optional
 
 from scipy.stats import norm
 
-from polyfon.strategies.base import BaseStrategy, Context, Signal, register
+from polyfon.strategies.base import BaseStrategy, Context, ReplayPlan, Signal, register
 from polyfon.utils.fees import taker_fee_usdc
 
 
@@ -81,6 +82,7 @@ class TDEStrategy(BaseStrategy):
         theta_entry: float = 0.05,
         tau_max: float = 90.0,
         tau_min: float = 15.0,
+        replay_cadence_seconds: float = 1.0,
         epsilon_sat: float = 0.15,
         theta_sat: float = 0.005,
         q_max: float = 1.0,
@@ -100,6 +102,7 @@ class TDEStrategy(BaseStrategy):
         self.theta_entry = theta_entry
         self.tau_max = tau_max
         self.tau_min = tau_min
+        self.replay_cadence_seconds = replay_cadence_seconds
         self.epsilon_sat = epsilon_sat
         self.theta_sat = theta_sat
         self.q_max = q_max
@@ -202,6 +205,21 @@ class TDEStrategy(BaseStrategy):
             )
 
         return None
+
+    def build_replay_plan(self, window: Any) -> ReplayPlan:
+        start = window.end_et - timedelta(seconds=self.tau_max)
+        end = window.end_et - timedelta(seconds=self.tau_min)
+        if end < start:
+            return ReplayPlan(eval_times=[])
+        if self.replay_cadence_seconds <= 0:
+            raise ValueError("replay_cadence_seconds must be > 0")
+        eval_times = []
+        current = start
+        step = timedelta(seconds=self.replay_cadence_seconds)
+        while current <= end:
+            eval_times.append(current)
+            current += step
+        return ReplayPlan(eval_times=eval_times, stop_on_signal=True, cadence_seconds=self.replay_cadence_seconds)
 
     def on_window_close(self, window: Any, context: Context) -> Optional[Signal]:
         return None
