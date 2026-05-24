@@ -1,6 +1,7 @@
 """CLI entry point for polyfon."""
 import asyncio
 import inspect
+
 import click
 from rich.console import Console
 from rich.table import Table
@@ -57,6 +58,14 @@ def _print_strategy_params(strat_class: type, overrides: dict) -> dict:
     return instance
 
 
+def _run_async_command(coro, shutdown_message: str) -> None:
+    """Run an async CLI command with graceful Ctrl-C handling."""
+    try:
+        asyncio.run(coro())
+    except KeyboardInterrupt:
+        console.print(f"[yellow]{shutdown_message}[/]")
+
+
 @click.group()
 def cli():
     """Polyfon — 5-minute crypto prediction market trading system."""
@@ -79,7 +88,7 @@ def collect(coins: str | None) -> None:
             console.print("[yellow]Shutting down collector...[/]")
             await orch.stop()
 
-    asyncio.run(_run())
+    _run_async_command(_run, "Collection interrupted.")
 
 
 @cli.command()
@@ -110,12 +119,15 @@ def dry(strategy: str, coins: str | None, do_collect: bool, params: tuple[str, .
         engine = ExecutionEngine(mode="dry", strategy=strat_instance, coins=coin_list)
         try:
             await engine.run_dry()
+        except asyncio.CancelledError:
+            console.print("[yellow]Dry run cancellation received...[/]")
+            raise
         finally:
             await engine.stop()
             if orch:
                 await orch.stop()
 
-    asyncio.run(_run())
+    _run_async_command(_run, "Dry run interrupted.")
 
 
 @cli.command()
@@ -153,7 +165,7 @@ def shadow(strategy: str, coins: str | None, collect: bool, params: tuple[str, .
             if orch:
                 await orch.stop()
 
-    asyncio.run(_run())
+    _run_async_command(_run, "Shadow mode interrupted.")
 
 
 @cli.command()
