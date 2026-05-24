@@ -534,18 +534,14 @@ class ExecutionEngine:
         console = Console()
         console.print(f"[bold cyan]Dry run: {len(windows)} historical windows[/]")
 
-        reports: List[DryWindowReport] = []
-        for w in windows:
-            if not self._running:
-                break
-            reports.append(await self._check_dry_window(w))
-
         total_pnl = 0.0
         any_realized = False
         for idx, w in enumerate(windows, start=1):
             if not self._running:
                 break
-            report = next((r for r in reports if r.window_id == w.id), self._init_dry_report(w))
+            label = f"{w.underlying} {_window_label(w)}"
+            console.print(f"[dim]Processing window {idx}/{len(windows)}: {label}…[/]")
+            report = await self._check_dry_window(w)
             realized_pnls = await self._finalize_dry_window(w, report)
             if realized_pnls:
                 any_realized = True
