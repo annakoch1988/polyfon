@@ -45,7 +45,9 @@ class Window(Base):
     start_et = Column(DateTime, nullable=False)
     end_et = Column(DateTime, nullable=False)
     outcome = Column(String, nullable=True)  # "Yes" (UP) or "No" (DOWN), once resolved
-    status = Column(String, default="pending")  # pending, open, closed, resolved
+    status = Column(String, default="pending")  # pending, open, closed, resolved, invalid
+    invalid_reason = Column(String, nullable=True)
+    invalidated_at = Column(DateTime, nullable=True)
     run_session_id = Column(String, ForeignKey("run_sessions.id"), nullable=True)
 
     # Polymarket internal metadata (needed for WS subscription + fees)

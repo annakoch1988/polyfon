@@ -47,10 +47,12 @@ class CollectionOrchestrator:
         self.spot = BinanceSpotCollector(
             coins=self.coins,
             on_price=self._on_spot_price,
+            on_disconnect=self._on_spot_disconnect,
         )
         self.book = PolymarketBookCollector(
             on_book=self._on_book,
             on_resolution=self._on_resolution,
+            on_disconnect=self._on_book_disconnect,
             carry_timeout_sec=5.0,
         )
         self._running = False
@@ -65,14 +67,24 @@ class CollectionOrchestrator:
         # Cache: token_id -> window_id for the hot book path
         self._token_to_window: Dict[str, str] = {}
         self._book_active_tokens: set[str] = set()
+        self._invalidated_window_ids: set[str] = set()
+        self._spot_open_deadlines: Dict[str, datetime] = {}
 
     # ---- persistence callbacks + workers ---------------------------------------
 
     def _on_spot_price(self, symbol: str, price: float, ts: datetime) -> None:
+        self._spot_open_deadlines.pop(symbol.upper(), None)
         try:
             self._spot_queue.put_nowait((symbol, price, ts))
         except asyncio.QueueFull:
             logger.warning("Spot queue full – dropping tick for %s", symbol)
+            asyncio.create_task(
+                self._invalidate_windows_for_underlyings(
+                    [symbol.upper()],
+                    reason="spot_queue_overflow",
+                    ts=ts,
+                )
+            )
 
     async def _spot_worker(self) -> None:
         while self._running:
@@ -94,6 +106,26 @@ class CollectionOrchestrator:
                 )
             self._spot_queue.task_done()
 
+    async def _spot_open_watchdog(self) -> None:
+        while self._running:
+            await asyncio.sleep(0.25)
+            if not self._running:
+                break
+            now = datetime.now(timezone.utc)
+            overdue = [
+                underlying
+                for underlying, deadline in list(self._spot_open_deadlines.items())
+                if now >= deadline
+            ]
+            for underlying in overdue:
+                self._spot_open_deadlines.pop(underlying, None)
+            if overdue:
+                await self._invalidate_windows_for_underlyings(
+                    overdue,
+                    reason="spot_initial_tick_timeout",
+                    ts=now,
+                )
+
     def _on_book(
         self,
         token_id: str,
@@ -103,14 +135,123 @@ class CollectionOrchestrator:
         ask_size: Optional[float],
         last_trade_price: Optional[float],
         ts: datetime,
+        stale: bool = False,
     ) -> None:
         window_id = self._token_to_window.get(token_id)
         try:
             self._book_queue.put_nowait(
-                (token_id, window_id, best_bid, best_ask, bid_size, ask_size, last_trade_price, ts)
+                (token_id, window_id, best_bid, best_ask, bid_size, ask_size, last_trade_price, ts, stale)
             )
         except asyncio.QueueFull:
             logger.warning("Book queue full – dropping update for %s", token_id)
+            asyncio.create_task(
+                self._invalidate_window_for_token(
+                    token_id,
+                    reason="book_queue_overflow",
+                    ts=ts,
+                )
+            )
+
+    def _on_spot_disconnect(self, coins: list[str], ts: datetime, reason: str) -> None:
+        asyncio.create_task(self._invalidate_windows_for_underlyings(coins, reason=reason, ts=ts))
+
+    def _on_book_disconnect(self, asset_ids: list[str], ts: datetime, reason: str) -> None:
+        asyncio.create_task(self._invalidate_windows_for_tokens(asset_ids, reason=reason, ts=ts))
+
+    async def _invalidate_windows_for_underlyings(self, underlyings: list[str], reason: str, ts: datetime) -> int:
+        targets = [u.upper() for u in underlyings if u]
+        if not targets:
+            return 0
+
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.status == "open",
+                    Window.underlying.in_(targets),
+                )
+            )
+            windows = result.scalars().all()
+            count = 0
+            for win in windows:
+                if win.id in self._invalidated_window_ids:
+                    continue
+                win.status = "invalid"
+                win.invalid_reason = reason
+                win.invalidated_at = self._naive_utc(ts)
+                self._invalidated_window_ids.add(win.id)
+                self._discovered_windows[win.slug] = win
+                self._token_to_window.pop(win.up_token_id, None)
+                self._token_to_window.pop(win.down_token_id, None)
+                console.print(
+                    f"  [bold red]INVALID[/] {win.underlying} "
+                    f"{_fmt_et(win.start_et)}–{_fmt_et(win.end_et)}  "
+                    f"[dim]{reason}[/]"
+                )
+                count += 1
+        if count:
+            await self._refresh_book_subscription()
+        return count
+
+    async def _invalidate_windows_for_tokens(self, asset_ids: list[str], reason: str, ts: datetime) -> int:
+        token_ids = [t for t in asset_ids if t]
+        if not token_ids:
+            return 0
+
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.status == "open",
+                    or_(Window.up_token_id.in_(token_ids), Window.down_token_id.in_(token_ids)),
+                )
+            )
+            windows = result.scalars().all()
+            count = 0
+            for win in windows:
+                if win.id in self._invalidated_window_ids:
+                    continue
+                win.status = "invalid"
+                win.invalid_reason = reason
+                win.invalidated_at = self._naive_utc(ts)
+                self._invalidated_window_ids.add(win.id)
+                self._discovered_windows[win.slug] = win
+                self._token_to_window.pop(win.up_token_id, None)
+                self._token_to_window.pop(win.down_token_id, None)
+                console.print(
+                    f"  [bold red]INVALID[/] {win.underlying} "
+                    f"{_fmt_et(win.start_et)}–{_fmt_et(win.end_et)}  "
+                    f"[dim]{reason}[/]"
+                )
+                count += 1
+        if count:
+            await self._refresh_book_subscription()
+        return count
+
+    async def _invalidate_window_for_token(self, token_id: str, reason: str, ts: datetime) -> int:
+        return await self._invalidate_windows_for_tokens([token_id], reason=reason, ts=ts)
+
+    async def _refresh_book_subscription(self) -> None:
+        all_ids = list(self._token_to_window.keys())
+        async with session_scope() as sess:
+            result = await sess.execute(
+                select(Window).where(
+                    Window.outcome.is_(None),
+                    Window.status.in_(["pending", "open", "closed"]),
+                    Window.underlying.in_(self.coins),
+                )
+            )
+            for win in result.scalars():
+                if win.status == "invalid":
+                    continue
+                all_ids.extend([win.up_token_id, win.down_token_id])
+        all_ids = list(set(all_ids))
+        if all_ids:
+            if self._book_active_tokens and set(all_ids) != self._book_active_tokens:
+                await self.book.update_assets(all_ids)
+            elif not self._book_active_tokens:
+                self.book.start(all_ids)
+            self._book_active_tokens = set(all_ids)
+        else:
+            self._book_active_tokens = set()
 
     async def _book_worker(self) -> None:
         BATCH_SIZE = 500
@@ -128,7 +269,7 @@ class CollectionOrchestrator:
                     break
 
             async with session_scope() as sess:
-                for token_id, window_id, best_bid, best_ask, bid_size, ask_size, ltp, ts in batch:
+                for token_id, window_id, best_bid, best_ask, bid_size, ask_size, ltp, ts, stale in batch:
                     sess.add(
                         OrderBook(
                             id=str(uuid.uuid4()),
@@ -139,7 +280,7 @@ class CollectionOrchestrator:
                             bid_size=bid_size,
                             ask_size=ask_size,
                             last_trade_price=ltp,
-                            stale=False,
+                            stale=stale,
                             timestamp=ts,
                         )
                     )
@@ -288,6 +429,9 @@ class CollectionOrchestrator:
                     self._discovered_windows[win.slug] = win
                     self._token_to_window[win.up_token_id] = win.id
                     self._token_to_window[win.down_token_id] = win.id
+                    self._spot_open_deadlines[win.underlying.upper()] = (
+                        next_boundary + timedelta(seconds=settings.binance_silence_threshold_sec)
+                    )
                     self._log_window("OPEN", win)
                     changed = True
 
@@ -295,20 +439,7 @@ class CollectionOrchestrator:
             # Keep unresolved windows subscribed (including closed ones)
             # so market_resolved WebSocket events are still received.
             if changed:
-                all_ids = list(self._token_to_window.keys())
-                async with session_scope() as sess:
-                    result = await sess.execute(
-                        select(Window).where(
-                            Window.outcome.is_(None),
-                            Window.underlying.in_(self.coins),
-                        )
-                    )
-                    for win in result.scalars():
-                        all_ids.extend([win.up_token_id, win.down_token_id])
-                all_ids = list(set(all_ids))
-                if self._book_active_tokens and set(all_ids) != self._book_active_tokens:
-                    await self.book.update_assets(all_ids)
-                    self._book_active_tokens = set(all_ids)
+                await self._refresh_book_subscription()
 
     # ---- shutdown -------------------------------------------------------------
 
@@ -493,6 +624,7 @@ class CollectionOrchestrator:
         self._tasks.append(asyncio.create_task(self._spot_worker()))
         self._tasks.append(asyncio.create_task(self._book_worker()))
         self._tasks.append(asyncio.create_task(self._window_manager()))
+        self._tasks.append(asyncio.create_task(self._spot_open_watchdog()))
 
         ticks = 0
         while self._running:

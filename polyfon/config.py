@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
     coins: str = "BTC,ETH"
     log_level: str = "INFO"
+    binance_silence_threshold_sec: float = 5.0
 
     @property
     def coin_list(self) -> List[str]:

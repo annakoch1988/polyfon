@@ -199,6 +199,9 @@ LOG_LEVEL=INFO
 - Once a window is resolved (`outcome` set), its tokens are removed from the subscription on the next boundary update.
 - The `_window_manager` is timer-driven: sleeps to each 5-min ET boundary, opens/closes deterministically. No polling loop.
 - `_sync_windows` runs every 60s to discover new events; skips windows whose `start_et` is >1s in the past.
+- Open windows are invalidated on confirmed live-data loss: spot disconnect, spot queue overflow, Polymarket book disconnect, Polymarket book queue overflow, and Binance spot silence beyond `binance_silence_threshold_sec`.
+- Binance spot silence invalidation applies both after ticks have been flowing and when no first Binance tick arrives within `binance_silence_threshold_sec` after a window opens.
+- Invalid windows keep `status="invalid"` with `invalid_reason` and `invalidated_at`; no backfill is attempted, and future pending windows may still open normally after reconnect.
 - **WDM strategy** (`polyfon/strategies/wdm.py`): Supplementary strategy, not part of the 18. Entry at T-10s based on spot displacement from window open price. Uses `up_best_ask` for BUY YES and `down_best_ask` for BUY NO. Confidence = min(|delta| / theta_sat, 1.0). Documented in `articles/window_delta_momentum_wdm.md`.
 - **Context fields**: `window_open_price` (earliest spot in window range), `up_best_bid`/`up_best_ask`/`down_best_bid`/`down_best_ask` (per-token OrderBook). Backward compat: `best_bid`/`best_ask` default to UP token values.
 - **Book ambiguity fixed**: `_build_context` queries UP and DOWN OrderBooks separately by `token_id`. `_simulate_fill` uses `token_map` to look up the correct token's book based on signal direction.

@@ -79,6 +79,7 @@ class ExecutionEngine:
                 .where(
                     SpotPrice.symbol == symbol,
                     SpotPrice.timestamp >= window.start_et,
+                    SpotPrice.timestamp <= now,
                 )
                 .order_by(SpotPrice.timestamp)
                 .limit(1)
@@ -87,32 +88,34 @@ class ExecutionEngine:
             if sp_open:
                 ctx.window_open_price = sp_open.price
 
-        # Latest order books per token (UP and DOWN separately).
+        # Order books at or before eval_time for historical alignment.
         async with session_scope() as sess:
-            result = await sess.execute(
+            q_up = (
                 select(OrderBook)
                 .where(
                     OrderBook.window_id == window.id,
                     OrderBook.token_id == window.up_token_id,
                 )
-                .order_by(desc(OrderBook.timestamp))
-                .limit(1)
             )
+            if eval_time:
+                q_up = q_up.where(OrderBook.timestamp <= now)
+            result = await sess.execute(q_up.order_by(desc(OrderBook.timestamp)).limit(1))
             ob_up = result.scalar_one_or_none()
             if ob_up:
                 ctx.up_best_bid = ob_up.best_bid
                 ctx.up_best_ask = ob_up.best_ask
 
         async with session_scope() as sess:
-            result = await sess.execute(
+            q_down = (
                 select(OrderBook)
                 .where(
                     OrderBook.window_id == window.id,
                     OrderBook.token_id == window.down_token_id,
                 )
-                .order_by(desc(OrderBook.timestamp))
-                .limit(1)
             )
+            if eval_time:
+                q_down = q_down.where(OrderBook.timestamp <= now)
+            result = await sess.execute(q_down.order_by(desc(OrderBook.timestamp)).limit(1))
             ob_down = result.scalar_one_or_none()
             if ob_down:
                 ctx.down_best_bid = ob_down.best_bid
@@ -140,7 +143,7 @@ class ExecutionEngine:
 
         return ctx
 
-    async def _on_signal(self, window: Window, signal: Signal) -> None:
+    async def _on_signal(self, window: Window, signal: Signal, eval_time: Optional[datetime] = None) -> None:
         """Handle a strategy signal: log it, and simulate a position if dry/shadow."""
         async with session_scope() as sess:
             ts = TradeSignal(
@@ -156,11 +159,13 @@ class ExecutionEngine:
             sess.add(ts)
 
         if self.mode in ("dry", "shadow"):
-            await self._simulate_fill(window, signal)
+            await self._simulate_fill(window, signal, eval_time=eval_time)
 
-    async def _simulate_fill(self, window: Window, signal: Signal) -> None:
-        """Simulate a fill at the current best bid/ask.
+    async def _simulate_fill(self, window: Window, signal: Signal, eval_time: Optional[datetime] = None) -> None:
+        """Simulate a fill at the best bid/ask.
 
+        For historical replay (eval_time set), uses the latest book at
+        or before eval_time.  For live (shadow), uses the latest book.
         Uses the correct token (UP / DOWN) based on signal direction.
         """
         token_map = {
@@ -175,14 +180,17 @@ class ExecutionEngine:
 
         price = None
         async with session_scope() as sess:
-            result = await sess.execute(
+            query = (
                 select(OrderBook)
                 .where(
                     OrderBook.window_id == window.id,
                     OrderBook.token_id == token_id,
                 )
-                .order_by(desc(OrderBook.timestamp))
-                .limit(1)
+            )
+            if eval_time:
+                query = query.where(OrderBook.timestamp <= eval_time)
+            result = await sess.execute(
+                query.order_by(desc(OrderBook.timestamp)).limit(1)
             )
             ob = result.scalar_one_or_none()
             if ob:
@@ -238,7 +246,7 @@ class ExecutionEngine:
         ctx = await self._build_context(window, eval_time=eval_time)
         signal = self.strategy.on_tick(window, ctx)
         if signal:
-            await self._on_signal(window, signal)
+            await self._on_signal(window, signal, eval_time=eval_time)
             console = Console()
             console.print(
                 f"  [yellow]SIGNAL[/] {window.underlying} "
@@ -261,11 +269,12 @@ class ExecutionEngine:
         """Dry mode: replay historical windows from DB at T-10s."""
         self._running = True
         async with session_scope() as sess:
-            result = await sess.execute(
-                select(Window).where(
-                    Window.status.in_(["closed", "resolved"]),
-                )
+            query = select(Window).where(
+                Window.status.in_(["closed", "resolved"]),
             )
+            if self.coins:
+                query = query.where(Window.underlying.in_(self.coins))
+            result = await sess.execute(query)
             windows = result.scalars().all()
 
         console = Console()

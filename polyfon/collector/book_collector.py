@@ -8,6 +8,7 @@ WebSocket endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
 """
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Any
 
@@ -16,6 +17,8 @@ from websockets import State
 from websockets.exceptions import ConnectionClosed
 
 from polyfon.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class PolymarketBookCollector:
@@ -41,15 +44,18 @@ class PolymarketBookCollector:
         self,
         on_book: Optional[Callable[[str, Optional[float], Optional[float],
                                      Optional[float], Optional[float],
-                                     Optional[float], datetime], None]] = None,
+                                     Optional[float], datetime, bool], None]] = None,
         on_resolution: Optional[Callable[[str, str], None]] = None,
+        on_disconnect: Optional[Callable[[list[str], datetime, str], None]] = None,
         carry_timeout_sec: float = 5.0,
     ):
         self.on_book = on_book
         self.on_resolution = on_resolution
+        self.on_disconnect = on_disconnect
         self.carry_timeout_sec = carry_timeout_sec
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._carry_task: Optional[asyncio.Task] = None
         self._assets_ids: list[str] = []
         self._ws: Optional[Any] = None
         self._last: Dict[str, Dict[str, Any]] = {}
@@ -188,6 +194,7 @@ class PolymarketBookCollector:
                     record.get("ask_size"),
                     record.get("last_trade_price"),
                     record["timestamp"],
+                    record.get("stale", False),
                 )
             except Exception:
                 pass  # Don't let callback failures kill the collector
@@ -243,10 +250,18 @@ class PolymarketBookCollector:
                         except asyncio.CancelledError:
                             pass
 
-            except ConnectionClosed:
-                pass
-            except Exception:
-                pass
+            except ConnectionClosed as exc:
+                if self._running and self.on_disconnect:
+                    try:
+                        self.on_disconnect(list(self._assets_ids), datetime.now(timezone.utc), f"book_disconnect:{type(exc).__name__}")
+                    except Exception:
+                        logger.exception("Book disconnect callback failed")
+            except Exception as exc:
+                if self._running and self.on_disconnect:
+                    try:
+                        self.on_disconnect(list(self._assets_ids), datetime.now(timezone.utc), f"book_disconnect:{type(exc).__name__}")
+                    except Exception:
+                        logger.exception("Book disconnect callback failed")
 
             self._ws = None
             if self._running:
@@ -284,15 +299,11 @@ class PolymarketBookCollector:
             self._handle_last_trade(msg)
         elif event_type == "market_resolved":
             self._handle_resolution(msg)
-            # Debug: log raw message to stderr for now
-            import sys
-            print(f"[RESOLUTION EVENT] {msg}", file=sys.stderr, flush=True)
+            logger.info("Resolution event: %s", msg)
         elif event_type in ("tick_size_change", "new_market", "pong", None):
             pass
         else:
-            # Debug: log unknown event types
-            import sys
-            print(f"[UNKNOWN EVENT] type={event_type!r} msg={msg!r}", file=sys.stderr, flush=True)
+            logger.debug("Unknown event type=%r msg=%r", event_type, msg)
 
     async def _carry_forward_loop(self) -> None:
         """Background task: emit stale carry-forward records for silent tokens."""
@@ -313,12 +324,30 @@ class PolymarketBookCollector:
         self._running = True
         self._assets_ids = list(asset_ids)
         self._task = asyncio.create_task(self._consume())
-        asyncio.create_task(self._carry_forward_loop())
+        self._carry_task = asyncio.create_task(self._carry_forward_loop())
 
     async def update_assets(self, asset_ids: list[str]) -> None:
-        """Update the subscription list without reconnecting."""
+        """Update the subscription list.
+
+        NOTE: The Polymarket market WS protocol uses additive-only
+        subscription via {"operation": "subscribe", ...}. There is no
+        unsubscribe mechanism. When tokens need to be removed, we force
+        a reconnect so the new connection starts with a clean subscription.
+        """
         async with self._lock:
+            old_ids = set(self._assets_ids)
+            new_ids = set(asset_ids)
             self._assets_ids = list(asset_ids)
+
+            # If tokens were removed, force reconnect (additive-only protocol)
+            if old_ids and not new_ids.issuperset(old_ids):
+                if self._ws:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                return
+
             if self._ws and self._ws.state == State.OPEN:
                 try:
                     await self._ws.send(json.dumps(self._update_subscription_message(self._assets_ids)))
@@ -336,5 +365,11 @@ class PolymarketBookCollector:
             self._task.cancel()
             try:
                 await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._carry_task:
+            self._carry_task.cancel()
+            try:
+                await self._carry_task
             except asyncio.CancelledError:
                 pass
