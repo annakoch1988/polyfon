@@ -91,6 +91,7 @@ polyfon/
         base.py               # BaseStrategy, Context, Signal, StrategyRegistry
         sla.py                # Strategy 1: Spot-Led Latency Arbitrage
         wdm.py                # Strategy: Window Delta Momentum
+        tde.py                # Strategy: Time Decay Effect
     execution/
         engine.py             # ExecutionEngine (dry/shadow mode)
     utils/
@@ -100,6 +101,7 @@ scripts/
 docs/
     sla.md                 # SLA strategy reference
     wdm.md                 # WDM strategy reference
+    tde.md                 # TDE strategy reference
 ```
 
 ## Execution Modes
@@ -152,6 +154,7 @@ python -m scripts.run collect --coins=BTC,ETH
 # Dry mode (replay from DB)
 python -m scripts.run dry --strategy=SLA
 python -m scripts.run dry --strategy=WDM
+python -m scripts.run dry --strategy=TDE
 python -m scripts.run dry --strategy=SLA --coins=BTC,ETH --collect
 
 # Shadow mode (real-time simulation)
@@ -159,6 +162,11 @@ python -m scripts.run shadow --strategy=WDM --coins=BTC,ETH --collect
 
 # Dry/Shadow CLI now supports --param key=value (repeatable)
 python -m scripts.run dry --strategy=WDM --param theta_entry=0.0005 --param tau_max=20
+
+# TDE examples
+python -m scripts.run dry --strategy=TDE
+python -m scripts.run dry --strategy=TDE --param tau_max=60 --param theta_entry=0.04
+python -m scripts.run shadow --strategy=TDE --collect
 
 # List strategies
 python -m scripts.run list-strategies
@@ -177,7 +185,7 @@ LOG_LEVEL=INFO
 1. **Phase 1 (COMPLETE)**: Bootstrap — schema, config, WebSocket collectors, fair pricing, SLA strategy, dry mode, CLI.
 2. **Phase 2 (IN PROGRESS)**: Shadow mode refinement, session tracking, resolution engine (WS + API), orphan cleanup.
 3. **Phase 3**: Wet mode (CLOB API orders, private key). **POSTPONED.**
-4. **Phase 4**: Additional strategies (PMR, MPR, VIT, TDE, CRV, OBI, VPX, CLL, HMM, ROM, MIP, PFR, RND, HPE, KLD, ARL, EVT).
+4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE implemented. Remaining: PMR, MPR, VIT, CRV, OBI, VPX, CLL, HMM, ROM, MIP, PFR, RND, HPE, KLD, ARL, EVT.
 5. **Phase 5**: Python ML bridge (GARCH, EVT, HMM, Hawkes) for advanced strategies.
 
 ## Agent Protocol
@@ -202,6 +210,7 @@ LOG_LEVEL=INFO
 - Open windows are invalidated on confirmed live-data loss: spot disconnect, spot queue overflow, Polymarket book disconnect, Polymarket book queue overflow, and Binance spot silence beyond `binance_silence_threshold_sec`.
 - Binance spot silence invalidation applies both after ticks have been flowing and when no first Binance tick arrives within `binance_silence_threshold_sec` after a window opens.
 - Invalid windows keep `status="invalid"` with `invalid_reason` and `invalidated_at`; no backfill is attempted, and future pending windows may still open normally after reconnect.
+- **TDE strategy** (`polyfon/strategies/tde.py`): Time Decay Effect. Entry at τ ∈ [15, 90]s when `|fair_prob - market_price| > theta_entry` AND the theta direction (∂π̂/∂τ) agrees that mispricing is widening. Stateless per-tick. Uses `up_best_ask` for BUY_YES, `down_best_ask` for BUY_NO. Computes theta analytically via `_theta()` — a closed-form derivative of the binary call formula. Documented in `docs/tde.md`.
 - **WDM strategy** (`polyfon/strategies/wdm.py`): Supplementary strategy, not part of the 18. Entry at T-10s based on spot displacement from window open price. Uses `up_best_ask` for BUY YES and `down_best_ask` for BUY NO. Confidence = min(|delta| / theta_sat, 1.0). Documented in `articles/window_delta_momentum_wdm.md`.
 - **Context fields**: `window_open_price` (earliest spot in window range), `up_best_bid`/`up_best_ask`/`down_best_bid`/`down_best_ask` (per-token OrderBook). Backward compat: `best_bid`/`best_ask` default to UP token values.
 - **Book ambiguity fixed**: `_build_context` queries UP and DOWN OrderBooks separately by `token_id`. `_simulate_fill` uses `token_map` to look up the correct token's book based on signal direction.
