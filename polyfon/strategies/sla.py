@@ -32,9 +32,9 @@ class SLAStrategy(BaseStrategy):
         theta_entry: float = 0.05,
         tau_min: float = 30.0,
         replay_cadence_seconds: float = 1.0,
-        q_max: float = 100.0,
-        order_class: str = "limit",
-        time_in_force: str = "GTC",
+        q_max: float = 1.0,
+        order_class: str = "market",
+        time_in_force: str = "FOK",
         fee_rate: float = 0.07,
     ):
         if order_class not in ("market", "limit"):

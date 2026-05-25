@@ -9,7 +9,7 @@ from rich.console import Console
 from sqlalchemy import select, desc, func
 
 from polyfon.database import session_scope
-from polyfon.models import Window, OrderBook, SpotPrice, Position, TradeSignal
+from polyfon.models import Window, OrderBook, SpotPrice, TradeSignal
 from polyfon.strategies.base import BaseStrategy, Context, ReplayPlan, Signal
 from polyfon.pricing.fair_probability import fair_probability
 from polyfon.pricing.volatility import RollingVolatility
@@ -41,6 +41,7 @@ class WindowTradeSummary:
     fees: float
     pnl: float
     outcome: str
+    opened_at: Optional[datetime] = None
 
 
 @dataclass
@@ -59,6 +60,7 @@ class DryWindowReport:
     order_class: Optional[str] = None
     order_desc: Optional[str] = None
     signal_time: Optional[str] = None
+    fills: List[FillResult] = field(default_factory=list)
     trades: List[WindowTradeSummary] = field(default_factory=list)
     resolution: Optional[str] = None
     realized_pnl: float = 0.0
@@ -133,6 +135,7 @@ class ExecutionEngine:
             console.print("")
             console.print("Trade:")
             console.print(f"  side: {trade.side}")
+            console.print(f"  time: {trade.opened_at.strftime('%H:%M:%S') if trade.opened_at else 'N/A'}")
             console.print(f"  shares: {trade.shares:.4f}")
             console.print(f"  entry: {trade.entry_price:.4f}")
             console.print(f"  cost: {trade.cost:.4f}")
@@ -367,25 +370,10 @@ class ExecutionEngine:
             "SELL_NO": "SHORT_NO",
         }
 
-        async with session_scope() as sess:
-            position_id = str(uuid.uuid4())
-            opened_at = eval_time or datetime.now(timezone.utc)
-            pos = Position(
-                id=position_id,
-                mode=self.mode,
-                window_id=window.id,
-                strategy=signal.strategy,
-                side=side_map.get(signal.direction, "LONG_YES"),
-                entry_price=price,
-                size=signal.size,
-                fees_paid=fee,
-                status="open",
-                opened_at=opened_at,
-            )
-            sess.add(pos)
+        opened_at = eval_time or datetime.now(timezone.utc)
 
         return FillResult(
-            position_id=position_id,
+            position_id=str(uuid.uuid4()),
             order_class=order_class,
             side=side_map.get(signal.direction, "LONG_YES"),
             shares=signal.size,
@@ -393,7 +381,7 @@ class ExecutionEngine:
             notional=notional,
             entry_fee=fee,
             total_cost=notional + fee,
-            eval_time=eval_time or datetime.now(timezone.utc),
+            eval_time=opened_at,
         )
 
     async def _check_window(self, window_id: str) -> None:
@@ -425,12 +413,14 @@ class ExecutionEngine:
             if not signal:
                 continue
 
-            fill = await self._on_signal(window, signal, eval_time=eval_time)
+            fill = await self._simulate_fill(window, signal, eval_time=eval_time)
+            if fill is None:
+                continue
             order_class = str((signal.metadata or {}).get("order_class", "market")).lower()
             order_desc = (
                 f"order=market spend={fill.notional:.4f} shares={fill.shares:.4f} fee={fill.entry_fee:.5f} total_cost={fill.total_cost:.4f}"
-                if fill and order_class == "market"
-                else f"order=limit shares={signal.size:.4f} notional={((signal.metadata or {}).get('notional', 0.0)):.4f}"
+                if order_class == "market"
+                else f"order=limit shares={fill.shares:.4f} notional={fill.notional:.4f}"
                 if order_class == "limit"
                 else "order=unfilled"
             )
@@ -442,10 +432,10 @@ class ExecutionEngine:
             report.order_class = order_class
             report.order_desc = order_desc
             report.signal_time = eval_time.strftime('%H:%M:%S')
+            report.fills.append(fill)
             if plan.stop_on_signal:
-                return report
+                break
 
-        report.reason = "no signal"
         return report
 
     async def _finalize_dry_window(self, window: Window, report: DryWindowReport) -> List[float]:
@@ -456,56 +446,42 @@ class ExecutionEngine:
             return []
 
         realized_pnls: List[float] = []
-        async with session_scope() as sess:
-            result = await sess.execute(
-                select(Position)
-                .where(
-                    Position.mode == "dry",
-                    Position.window_id == window.id,
-                    Position.status == "open",
-                )
-                .order_by(Position.opened_at)
-            )
-            positions = result.scalars().all()
+        fee_rate = window.fee_rate or 0.07
+        resolution_label = "YES" if outcome == "YES" else "NO"
 
-            for pos in positions:
-                outcome_hit = (
-                    (outcome == "YES" and pos.side == "LONG_YES")
-                    or (outcome == "NO" and pos.side == "LONG_NO")
+        for fill in report.fills:
+            outcome_hit = (
+                (outcome == "YES" and fill.side == "LONG_YES")
+                or (outcome == "NO" and fill.side == "LONG_NO")
+            )
+            exit_price = 1.0 if outcome_hit else 0.0
+            pnl_value = net_pnl(
+                fill.shares,
+                fill.entry_price,
+                exit_price,
+                fee_rate,
+                fee_rate,
+            )
+            revenue = fill.shares * exit_price
+            cost = fill.shares * fill.entry_price + taker_fee_usdc(fill.shares, fill.entry_price, fee_rate)
+            exit_fee = taker_fee_usdc(fill.shares, exit_price, fee_rate)
+            realized_pnls.append(pnl_value)
+            win_label = "won" if outcome_hit else "lost"
+            report.trades.append(
+                WindowTradeSummary(
+                    side=fill.side,
+                    shares=fill.shares,
+                    entry_price=fill.entry_price,
+                    cost=cost,
+                    resolution=resolution_label,
+                    settlement=exit_price,
+                    revenue=revenue,
+                    fees=fill.entry_fee + exit_fee,
+                    pnl=pnl_value,
+                    outcome=win_label,
+                    opened_at=fill.eval_time,
                 )
-                exit_price = 1.0 if outcome_hit else 0.0
-                fee_rate = window.fee_rate or 0.07
-                pnl_value = net_pnl(
-                    pos.size,
-                    pos.entry_price,
-                    exit_price,
-                    fee_rate,
-                    fee_rate,
-                )
-                revenue = pos.size * exit_price
-                cost = pos.size * pos.entry_price + taker_fee_usdc(pos.size, pos.entry_price, fee_rate)
-                exit_fee = taker_fee_usdc(pos.size, exit_price, fee_rate)
-                pos.exit_price = exit_price
-                pos.pnl = pnl_value
-                pos.status = "closed"
-                pos.closed_at = datetime.now(timezone.utc)
-                realized_pnls.append(pnl_value)
-                resolution_label = "YES" if outcome == "YES" else "NO"
-                win_label = "won" if outcome_hit else "lost"
-                report.trades.append(
-                    WindowTradeSummary(
-                        side=pos.side,
-                        shares=pos.size,
-                        entry_price=pos.entry_price,
-                        cost=cost,
-                        resolution=resolution_label,
-                        settlement=exit_price,
-                        revenue=revenue,
-                        fees=pos.fees_paid + exit_fee,
-                        pnl=pnl_value,
-                        outcome=win_label,
-                    )
-                )
+            )
 
         if realized_pnls:
             report.resolution = outcome
