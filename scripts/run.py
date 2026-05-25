@@ -108,6 +108,12 @@ def collect(coins: str | None) -> None:
     default=None,
     help="Convenience override for strategy replay_cadence_seconds in dry mode.",
 )
+@click.option(
+    "--max-windows",
+    type=int,
+    default=None,
+    help="Limit dry run to at most N windows (default: all).",
+)
 @click.option("--param", "params", multiple=True, help="Strategy parameter as key=value (repeatable).")
 def dry(
     strategy: str,
@@ -115,6 +121,7 @@ def dry(
     window_slugs: str | None,
     do_collect: bool,
     replay_cadence_seconds: float | None,
+    max_windows: int | None,
     params: tuple[str, ...],
 ) -> None:
     """Run dry mode: simulate strategy on historical DB data."""
@@ -132,6 +139,8 @@ def dry(
     scope_bits = [f"strategy={strategy}", f"coins={', '.join(coin_list)}"]
     if slug_list:
         scope_bits.append(f"window_slugs={', '.join(slug_list)}")
+    if max_windows is not None:
+        scope_bits.append(f"max_windows={max_windows}")
     console.print(f"[bold green]Dry mode: {' | '.join(scope_bits)}[/]")
     strat_instance = _print_strategy_params(strat_class, strat_kwargs)
 
@@ -144,7 +153,7 @@ def dry(
 
         engine = ExecutionEngine(mode="dry", strategy=strat_instance, coins=coin_list, window_slugs=slug_list)
         try:
-            await engine.run_dry()
+            await engine.run_dry(max_windows=max_windows)
         except asyncio.CancelledError:
             console.print("[yellow]Dry run cancellation received...[/]")
             raise

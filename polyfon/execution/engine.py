@@ -725,7 +725,7 @@ class ExecutionEngine:
 
     # ---- public API ----------------------------------------------------------
 
-    async def run_dry(self) -> None:
+    async def run_dry(self, max_windows: int | None = None) -> None:
         """Dry mode: replay historical windows from DB using strategy plans."""
         self._running = True
         async with session_scope() as sess:
@@ -738,6 +738,9 @@ class ExecutionEngine:
                 query = query.where(Window.slug.in_(self.window_slugs))
             result = await sess.execute(query)
             windows = result.scalars().all()
+
+        if max_windows is not None and max_windows < len(windows):
+            windows = windows[:max_windows]
 
         console = Console()
         console.print(f"[bold cyan]Dry run: {len(windows)} historical windows[/]")
