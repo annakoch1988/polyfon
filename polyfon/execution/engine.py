@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 from rich.console import Console
+from scipy import stats
 from sqlalchemy import select, desc, func
 
 from polyfon.database import session_scope
@@ -295,6 +297,98 @@ class ExecutionEngine:
         console.print(f"  Realized PnL: {report.realized_pnl:.4f}")
         console.print(f"  Running PnL:  {running_pnl:.4f}")
         console.print(divider)
+
+    @staticmethod
+    def _print_statistics(
+        *,
+        trade_pnls: List[float],
+        total_pnl: float,
+        processed_windows: int,
+        signaled_windows: int,
+        filled_windows: int,
+        total_trades: int,
+    ) -> None:
+        console = Console()
+        console.print("")
+        console.print("[bold yellow]" + "=" * 72 + "[/]")
+        console.print("[bold yellow]  DRY RUN STATISTICAL SUMMARY[/]")
+        console.print("[bold yellow]" + "=" * 72 + "[/]")
+        console.print(f"  Windows processed: {processed_windows}")
+        console.print(f"  Windows signaled:  {signaled_windows}")
+        console.print(f"  Windows filled:    {filled_windows}")
+        console.print(f"  Total trades:      {total_trades}")
+        console.print(f"  Total PnL:         {total_pnl:+.4f}")
+        console.print("-" * 72)
+
+        n = len(trade_pnls)
+        if n < 2:
+            console.print("[dim]  Insufficient trades for statistics (need >= 2).[/]")
+            console.print("=" * 72)
+            return
+
+        arr = np.array(trade_pnls, dtype=np.float64)
+        mean_val = float(np.mean(arr))
+        std_val = float(np.std(arr, ddof=1))
+        median_val = float(np.median(arr))
+        pnl_min = float(np.min(arr))
+        pnl_max = float(np.max(arr))
+
+        wins = int(np.sum(arr > 0))
+        losses = int(np.sum(arr < 0))
+        win_rate = wins / n * 100
+        gross_gain = float(np.sum(arr[arr > 0]))
+        gross_loss = float(np.sum(arr[arr < 0]))
+        profit_factor = gross_gain / abs(gross_loss) if gross_loss != 0 else float("inf")
+
+        sharpe = (mean_val / std_val) if std_val > 0 else 0.0
+
+        t_stat, p_value = stats.ttest_1samp(arr, popmean=0, alternative="two-sided")
+        t_stat = float(t_stat)
+        p_value = float(p_value)
+        # One-sided: probability that mean > 0
+        p_value_one_sided = p_value / 2 if t_stat > 0 else 1.0 - p_value / 2
+
+        # 95% CI via t-distribution
+        ci_level = 0.95
+        df = n - 1
+        t_crit = float(stats.t.ppf((1 + ci_level) / 2, df))
+        ci_margin = t_crit * std_val / np.sqrt(n)
+        ci_low = mean_val - ci_margin
+        ci_high = mean_val + ci_margin
+
+        console.print(f"  Trades evaluated:  {n}")
+        console.print(f"  Mean PnL:          {mean_val:+.4f}")
+        console.print(f"  Median PnL:        {median_val:+.4f}")
+        console.print(f"  Std Dev:           {std_val:.4f}")
+        console.print(f"  Min:  {pnl_min:+.4f}   Max:  {pnl_max:+.4f}")
+        console.print(f"  Sharpe (mean/std): {sharpe:.4f}")
+        console.print(f"  Wins:   {wins} ({win_rate:.1f}%)")
+        console.print(f"  Losses: {losses} ({100 - win_rate:.1f}%)")
+        console.print(f"  Profit factor:     {profit_factor:.4f}")
+        console.print("-" * 72)
+        console.print("  Hypothesis test: H0 mean PnL = 0")
+        console.print(f"  t-statistic:       {t_stat:.4f}")
+        console.print(f"  p-value (2-sided): {p_value:.4f}")
+        console.print(f"  p-value (1-sided): {p_value_one_sided:.4f}")
+        console.print(f"  95% CI for mean:   [{ci_low:+.4f}, {ci_high:+.4f}]")
+
+        # Verdict
+        significant = p_value_one_sided < 0.05
+        if significant and mean_val > 0:
+            verdict = "STRATEGY APPEARS PROFITABLE (p < 0.05, one-sided)"
+            color = "green"
+        elif significant and mean_val < 0:
+            verdict = "STRATEGY APPEARS UNPROFITABLE (mean < 0, p < 0.05)"
+            color = "red"
+        elif not significant and mean_val > 0:
+            verdict = "INCONCLUSIVE (positive mean, but not statistically significant)"
+            color = "yellow"
+        else:
+            verdict = "INCONCLUSIVE (no significant edge detected)"
+            color = "yellow"
+
+        console.print(f"[bold {color}]  VERDICT: {verdict}[/]")
+        console.print("=" * 72)
 
     @staticmethod
     def _normalize_outcome(outcome: Optional[str]) -> Optional[str]:
@@ -651,7 +745,7 @@ class ExecutionEngine:
         await self._create_dry_run_session(len(windows))
 
         total_pnl = 0.0
-        any_realized = False
+        trade_pnls: List[float] = []
         processed_windows = 0
         signaled_windows = 0
         filled_windows = 0
@@ -676,6 +770,7 @@ class ExecutionEngine:
                 if realized_pnls:
                     any_realized = True
                     total_pnl += sum(realized_pnls)
+                    trade_pnls.extend(realized_pnls)
                 await self._persist_dry_window_result(w, report, idx)
                 self._render_dry_report(report, idx, len(windows), running_pnl=total_pnl)
         except Exception as exc:
@@ -692,11 +787,14 @@ class ExecutionEngine:
             raise
 
         if self._running:
-            if any_realized:
-                color = "green" if total_pnl >= 0 else "red"
-                console.print(f"[bold {color}]Total realized PnL: {total_pnl:.4f}[/]")
-            else:
-                console.print("[dim]No realized PnL (no fills or unresolved windows).[/]")
+            self._print_statistics(
+                trade_pnls=trade_pnls,
+                total_pnl=total_pnl,
+                processed_windows=processed_windows,
+                signaled_windows=signaled_windows,
+                filled_windows=filled_windows,
+                total_trades=total_trades,
+            )
 
         await self._finalize_dry_run_session(
             processed_windows=processed_windows,
