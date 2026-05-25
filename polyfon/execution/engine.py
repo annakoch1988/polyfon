@@ -242,7 +242,7 @@ class ExecutionEngine:
             link=_window_link(window),
         )
 
-    def _render_dry_report(self, report: DryWindowReport, window_index: int, total_windows: int) -> None:
+    def _render_dry_report(self, report: DryWindowReport, window_index: int, total_windows: int, *, running_pnl: float = 0.0) -> None:
         console = Console()
         divider = "=" * 72
         console.print(divider)
@@ -293,6 +293,7 @@ class ExecutionEngine:
         else:
             console.print("  No fills")
         console.print(f"  Realized PnL: {report.realized_pnl:.4f}")
+        console.print(f"  Running PnL:  {running_pnl:.4f}")
         console.print(divider)
 
     @staticmethod
@@ -676,7 +677,7 @@ class ExecutionEngine:
                     any_realized = True
                     total_pnl += sum(realized_pnls)
                 await self._persist_dry_window_result(w, report, idx)
-                self._render_dry_report(report, idx, len(windows))
+                self._render_dry_report(report, idx, len(windows), running_pnl=total_pnl)
         except Exception as exc:
             status = "failed"
             await self._finalize_dry_run_session(
