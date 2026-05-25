@@ -41,7 +41,7 @@ def net_pnl(shares: float, entry_price: float, exit_price: float,
             is_taker: bool = True) -> float:
     """Net PnL for a position, accounting for fees on both legs.
 
-    For a LONG_YES position: gross PnL = (exit - entry) * shares.
+    For a bought YES/NO contract: gross PnL = (exit - entry) * shares.
     Fees reduce PnL on both entry and exit.
     """
     gross = (exit_price - entry_price) * shares

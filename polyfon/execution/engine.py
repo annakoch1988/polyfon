@@ -1,15 +1,24 @@
 """Execution engine: runs strategies in dry or shadow mode."""
 import asyncio
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from rich.console import Console
 from sqlalchemy import select, desc, func
 
 from polyfon.database import session_scope
-from polyfon.models import Window, OrderBook, SpotPrice, TradeSignal
+from polyfon.models import (
+    DryRunSession,
+    DryRunTradeResult,
+    DryRunWindowResult,
+    OrderBook,
+    SpotPrice,
+    TradeSignal,
+    Window,
+)
 from polyfon.strategies.base import BaseStrategy, Context, ReplayPlan, Signal
 from polyfon.pricing.fair_probability import fair_probability
 from polyfon.pricing.volatility import RollingVolatility
@@ -20,7 +29,7 @@ from polyfon.utils.fees import net_pnl, taker_fee_usdc
 class FillResult:
     position_id: str
     order_class: str
-    side: str
+    position_outcome: str
     shares: float
     entry_price: float
     notional: float
@@ -31,7 +40,7 @@ class FillResult:
 
 @dataclass
 class WindowTradeSummary:
-    side: str
+    contract: str
     shares: float
     entry_price: float
     cost: float
@@ -88,6 +97,135 @@ class ExecutionEngine:
         self.window_slugs = window_slugs or []
         self._running = False
         self._vols: Dict[str, RollingVolatility] = {}
+        self._dry_run_session_id: Optional[str] = None
+
+    @staticmethod
+    def _naive_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    def _strategy_params_dict(self) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        for key, value in vars(self.strategy).items():
+            if key.startswith("_"):
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                params[key] = value
+            else:
+                params[key] = str(value)
+        return params
+
+    async def _create_dry_run_session(self, total_windows: int) -> str:
+        session_id = str(uuid.uuid4())
+        params = self._strategy_params_dict()
+        replay_cadence = params.get("replay_cadence_seconds")
+        async with session_scope() as sess:
+            sess.add(
+                DryRunSession(
+                    id=session_id,
+                    mode=self.mode,
+                    strategy=self.strategy.name,
+                    strategy_params_json=json.dumps(params, sort_keys=True),
+                    coins_csv=",".join(self.coins) if self.coins else None,
+                    window_slugs_csv=",".join(self.window_slugs) if self.window_slugs else None,
+                    replay_cadence_seconds=float(replay_cadence) if replay_cadence is not None else None,
+                    total_windows=total_windows,
+                    processed_windows=0,
+                    signaled_windows=0,
+                    filled_windows=0,
+                    total_trades=0,
+                    total_realized_pnl=0.0,
+                    started_at=self._naive_utc(datetime.now(timezone.utc)),
+                    status="running",
+                )
+            )
+        self._dry_run_session_id = session_id
+        return session_id
+
+    async def _persist_dry_window_result(self, window: Window, report: DryWindowReport, window_index: int) -> None:
+        if not self._dry_run_session_id:
+            return
+
+        signal_time = None
+        if report.signal_time:
+            try:
+                signal_time = datetime.combine(
+                    window.start_et.date(),
+                    datetime.strptime(report.signal_time, "%H:%M:%S").time(),
+                )
+            except ValueError:
+                signal_time = None
+
+        window_result_id = str(uuid.uuid4())
+        async with session_scope() as sess:
+            sess.add(
+                DryRunWindowResult(
+                    id=window_result_id,
+                    dry_run_session_id=self._dry_run_session_id,
+                    window_id=window.id,
+                    strategy=self.strategy.name,
+                    window_index=window_index,
+                    status=report.status,
+                    reason=report.reason,
+                    signal_direction=report.signal_direction,
+                    signal_edge=report.signal_edge,
+                    signal_confidence=report.signal_confidence,
+                    order_class=report.order_class,
+                    signal_time=signal_time,
+                    resolution=report.resolution,
+                    realized_pnl=report.realized_pnl,
+                    trade_count=len(report.trades),
+                )
+            )
+
+            for fill, trade in zip(report.fills, report.trades):
+                sess.add(
+                    DryRunTradeResult(
+                        id=str(uuid.uuid4()),
+                        dry_run_window_result_id=window_result_id,
+                        position_id=fill.position_id,
+                        contract=trade.contract,
+                        order_class=fill.order_class,
+                        shares=trade.shares,
+                        entry_price=trade.entry_price,
+                        notional=fill.notional,
+                        entry_fee=fill.entry_fee,
+                        total_cost=fill.total_cost,
+                        opened_at=self._naive_utc(fill.eval_time),
+                        resolution=trade.resolution,
+                        settlement_price=trade.settlement,
+                        revenue=trade.revenue,
+                        fees_paid=trade.fees,
+                        pnl=trade.pnl,
+                        outcome=trade.outcome,
+                    )
+                )
+
+    async def _finalize_dry_run_session(
+        self,
+        *,
+        processed_windows: int,
+        signaled_windows: int,
+        filled_windows: int,
+        total_trades: int,
+        total_realized_pnl: float,
+        status: str,
+        notes: Optional[str] = None,
+    ) -> None:
+        if not self._dry_run_session_id:
+            return
+        async with session_scope() as sess:
+            run = await sess.get(DryRunSession, self._dry_run_session_id)
+            if run:
+                run.processed_windows = processed_windows
+                run.signaled_windows = signaled_windows
+                run.filled_windows = filled_windows
+                run.total_trades = total_trades
+                run.total_realized_pnl = total_realized_pnl
+                run.finished_at = self._naive_utc(datetime.now(timezone.utc))
+                run.status = status
+                run.notes = notes
 
     def _get_or_create_vol(self, symbol: str) -> RollingVolatility:
         if symbol not in self._vols:
@@ -134,7 +272,7 @@ class ExecutionEngine:
         for trade in report.trades:
             console.print("")
             console.print("Trade:")
-            console.print(f"  side: {trade.side}")
+            console.print(f"  contract: {trade.contract}")
             console.print(f"  time: {trade.opened_at.strftime('%H:%M:%S') if trade.opened_at else 'N/A'}")
             console.print(f"  shares: {trade.shares:.4f}")
             console.print(f"  entry: {trade.entry_price:.4f}")
@@ -319,9 +457,7 @@ class ExecutionEngine:
         """
         token_map = {
             "BUY_YES": (window.up_token_id, "best_ask"),
-            "SELL_YES": (window.up_token_id, "best_bid"),
             "BUY_NO": (window.down_token_id, "best_ask"),
-            "SELL_NO": (window.down_token_id, "best_bid"),
         }
         token_id, field = token_map.get(signal.direction, (None, None))
         if token_id is None:
@@ -363,11 +499,9 @@ class ExecutionEngine:
         fee_rate = window.fee_rate or 0.07
         fee = taker_fee_usdc(signal.size, price, fee_rate)
 
-        side_map = {
-            "BUY_YES": "LONG_YES",
-            "SELL_YES": "SHORT_YES",
-            "BUY_NO": "LONG_NO",
-            "SELL_NO": "SHORT_NO",
+        outcome_map = {
+            "BUY_YES": "YES",
+            "BUY_NO": "NO",
         }
 
         opened_at = eval_time or datetime.now(timezone.utc)
@@ -375,7 +509,7 @@ class ExecutionEngine:
         return FillResult(
             position_id=str(uuid.uuid4()),
             order_class=order_class,
-            side=side_map.get(signal.direction, "LONG_YES"),
+            position_outcome=outcome_map.get(signal.direction, "YES"),
             shares=signal.size,
             entry_price=price,
             notional=notional,
@@ -439,7 +573,11 @@ class ExecutionEngine:
         return report
 
     async def _finalize_dry_window(self, window: Window, report: DryWindowReport) -> List[float]:
-        """Resolve and print realized PnL for one historical window."""
+        """Resolve and print realized PnL for one historical window.
+
+        Polymarket simulation is long-only at entry: BUY_YES or BUY_NO.
+        Synthetic short positions are intentionally not supported.
+        """
         outcome = self._normalize_outcome(window.outcome)
         if outcome is None:
             report.reason = "unresolved window"
@@ -451,8 +589,7 @@ class ExecutionEngine:
 
         for fill in report.fills:
             outcome_hit = (
-                (outcome == "YES" and fill.side == "LONG_YES")
-                or (outcome == "NO" and fill.side == "LONG_NO")
+                outcome == fill.position_outcome
             )
             exit_price = 1.0 if outcome_hit else 0.0
             pnl_value = net_pnl(
@@ -469,7 +606,7 @@ class ExecutionEngine:
             win_label = "won" if outcome_hit else "lost"
             report.trades.append(
                 WindowTradeSummary(
-                    side=fill.side,
+                    contract=fill.position_outcome,
                     shares=fill.shares,
                     entry_price=fill.entry_price,
                     cost=cost,
@@ -510,19 +647,48 @@ class ExecutionEngine:
         console = Console()
         console.print(f"[bold cyan]Dry run: {len(windows)} historical windows[/]")
 
+        await self._create_dry_run_session(len(windows))
+
         total_pnl = 0.0
         any_realized = False
-        for idx, w in enumerate(windows, start=1):
-            if not self._running:
-                break
-            label = f"{w.underlying} {_window_label(w)}"
-            console.print(f"[dim]Processing window {idx}/{len(windows)}: {label}…[/]")
-            report = await self._check_dry_window(w)
-            realized_pnls = await self._finalize_dry_window(w, report)
-            if realized_pnls:
-                any_realized = True
-                total_pnl += sum(realized_pnls)
-            self._render_dry_report(report, idx, len(windows))
+        processed_windows = 0
+        signaled_windows = 0
+        filled_windows = 0
+        total_trades = 0
+        status = "completed"
+
+        try:
+            for idx, w in enumerate(windows, start=1):
+                if not self._running:
+                    status = "interrupted"
+                    break
+                label = f"{w.underlying} {_window_label(w)}"
+                console.print(f"[dim]Processing window {idx}/{len(windows)}: {label}…[/]")
+                report = await self._check_dry_window(w)
+                realized_pnls = await self._finalize_dry_window(w, report)
+                processed_windows += 1
+                if report.signal_direction:
+                    signaled_windows += 1
+                if report.trades:
+                    filled_windows += 1
+                    total_trades += len(report.trades)
+                if realized_pnls:
+                    any_realized = True
+                    total_pnl += sum(realized_pnls)
+                await self._persist_dry_window_result(w, report, idx)
+                self._render_dry_report(report, idx, len(windows))
+        except Exception as exc:
+            status = "failed"
+            await self._finalize_dry_run_session(
+                processed_windows=processed_windows,
+                signaled_windows=signaled_windows,
+                filled_windows=filled_windows,
+                total_trades=total_trades,
+                total_realized_pnl=total_pnl,
+                status=status,
+                notes=str(exc),
+            )
+            raise
 
         if self._running:
             if any_realized:
@@ -530,6 +696,16 @@ class ExecutionEngine:
                 console.print(f"[bold {color}]Total realized PnL: {total_pnl:.4f}[/]")
             else:
                 console.print("[dim]No realized PnL (no fills or unresolved windows).[/]")
+
+        await self._finalize_dry_run_session(
+            processed_windows=processed_windows,
+            signaled_windows=signaled_windows,
+            filled_windows=filled_windows,
+            total_trades=total_trades,
+            total_realized_pnl=total_pnl,
+            status=status,
+            notes=None if status == "completed" else "dry run stopped before processing all windows",
+        )
 
         console.print("[bold green]Dry run complete.[/]")
 

@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 class Signal:
     """Trading signal produced by a strategy."""
     strategy: str
-    direction: str  # BUY_YES, SELL_YES, BUY_NO, SELL_NO
+    direction: str  # BUY_YES or BUY_NO for Polymarket entry simulation
     size: float
     expected_edge: float
     confidence: float = 1.0

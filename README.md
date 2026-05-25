@@ -156,19 +156,21 @@ ExecutionEngine:
     loads strategy via StrategyRegistry
     builds Context (spot, book, fair prob, tau, range_high/low)
     calls strategy.on_tick(window, context) → Signal
-    simulates fill, computes PnL at window resolution
+    simulates long-only Polymarket entries (`BUY_YES` / `BUY_NO` only), computes PnL at window resolution
 ```
+
+Polymarket simulation note: this project does not model synthetic short instruments. Bearish exposure is expressed as `BUY_NO`, not `SELL_YES`.
 
 ### Database Schema
 
 | Table | Purpose |
 |-------|---------|
-| **run_sessions** | Tracks collector start/stop |
+| **collect_run_sessions** | Tracks collector start/stop |
 | **windows** | 5-minute trading windows (slug, underlying, start_et, end_et, status, outcome) |
 | **spot_prices** | Binance spot ticks (symbol, price, timestamp) |
 | **order_books** | Best bid/ask per token (token_id, best_bid, best_ask, stale flag) |
 | **trade_signals** | Strategy entry signals (direction, size, edge, confidence) |
-| **positions** | Simulated/real positions (entry_price, size, pnl, fees, status) |
+| **positions** | Simulated/real bought-contract records (YES / NO contract, entry_price, size, pnl, fees, status) |
 | **config_kv** | Key-value settings storage |
 
 ---

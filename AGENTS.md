@@ -41,11 +41,11 @@ ExecutionEngine:
     loads StrategyRegistry → instantiates chosen strategy
     builds Context (spot, book per token, window_open_price, fair prob, tau)
     calls strategy.on_tick(window, context) → Signal
-    logs signal + simulates position (dry/shadow)
+    logs signal + simulates long-only Polymarket entry (BUY_YES / BUY_NO only) in dry/shadow
 
 Database (SQLite):
-    run_sessions, windows, spot_prices, order_books,
-    trade_signals, positions, config
+    collect_run_sessions, dry_run_sessions, dry_run_window_results, dry_run_trade_results,
+    windows, spot_prices, order_books, trade_signals, positions, config
 ```
 
 ## WebSocket Details
@@ -133,12 +133,15 @@ class MyStrategy(BaseStrategy):
 ```
 
 ## Database Schema (SQLAlchemy)
-- **RunSession**: id, started_at, finished_at (null = aborted/crashed)
+- **RunSession** (`collect_run_sessions`): id, started_at, finished_at (null = aborted/crashed)
+- **DryRunSession**: id, mode, strategy, strategy_params_json, coins_csv, window_slugs_csv, replay_cadence_seconds, total_windows, processed_windows, signaled_windows, filled_windows, total_trades, total_realized_pnl, started_at, finished_at, status, notes
+- **DryRunWindowResult**: id, dry_run_session_id, window_id, strategy, window_index, status, reason, signal_direction, signal_edge, signal_confidence, order_class, signal_time, resolution, realized_pnl, trade_count
+- **DryRunTradeResult**: id, dry_run_window_result_id, position_id, side, order_class, shares, entry_price, notional, entry_fee, total_cost, opened_at, resolution, settlement_price, revenue, fees_paid, pnl, outcome
 - **Window**: id, slug, title, underlying, start_et, end_et, outcome, status (pending/open/closed/resolved), run_session_id, up_token_id, down_token_id, condition_id, fee_rate, tick_size
 - **SpotPrice**: id, symbol, price, timestamp, source
 - **OrderBook**: id, window_id, token_id, best_bid, best_ask, bid_size, ask_size, last_trade_price, stale, timestamp
-- **TradeSignal**: id, strategy, window_id, direction, size, expected_edge, confidence, timestamp
-- **Position**: id, mode, window_id, strategy, side, entry_price, size, exit_price, pnl, fees_paid, status, opened_at, closed_at
+- **TradeSignal**: id, strategy, window_id, direction (`BUY_YES` or `BUY_NO` only for entry simulation), size, expected_edge, confidence, timestamp
+- **Position**: id, mode, window_id, strategy, contract_side (`YES` or `NO` contract only), entry_price, size, exit_price, pnl, fees_paid, status, opened_at, closed_at
 - **ConfigKV**: id, key, value
 
 ## Fee Rules
@@ -204,7 +207,9 @@ LOG_LEVEL=INFO
 - Carry-forward logic is in `PolymarketBookCollector`: if no message for >5s, emits stale record.
 - Use `StrategyRegistry.instantiate(name)` to create strategy instances.
 - Keep strategy logic stateless where possible; persist state via DB ConfigKV if needed.
+- Polymarket entry simulation is long-only. There is no `SHORT_YES` or `SHORT_NO` concept in this project. Bearish exposure must be expressed as `BUY_NO`, not `SELL_YES`.
 - `RunSession` tracks each collector start; `finished_at` null = interrupted.
+- `DryRunSession` tracks each historical replay run; window/trade detail is stored in `dry_run_window_results` and `dry_run_trade_results` for later analysis.
 - Unfinished windows (open/pending from previous sessions) are DELETED at startup, not resolved.
 - Unfinished windows (open/pending from previous sessions) are DELETED at startup (`Maintenance` section), not resolved.
 - Resolution is done by `_resolve_orphans()` which polls the Gamma API (`fetch_resolution(slug)`) for closed-but-unresolved windows. It runs at startup during `Maintenance` and every 60s in the main loop.

@@ -104,8 +104,8 @@ class SLAStrategy(BaseStrategy):
                     },
                 )
 
-        if mispricing < -self.theta_entry and context.best_bid is not None:
-            price = context.best_bid
+        if mispricing < -self.theta_entry and context.down_best_ask is not None:
+            price = context.down_best_ask
             resolved = self._resolve_order(price)
             if resolved is None:
                 return None
@@ -115,7 +115,7 @@ class SLAStrategy(BaseStrategy):
             if edge > 0:
                 return Signal(
                     strategy=self.name,
-                    direction="SELL_YES",
+                    direction="BUY_NO",
                     size=shares,
                     expected_edge=float(edge),
                     confidence=min(-mispricing / 0.20, 1.0),
