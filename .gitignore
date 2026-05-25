@@ -61,4 +61,4 @@ coverage.xml
 *.db-shm
 
 # Project specific
-articles
+polymarket-strategies
