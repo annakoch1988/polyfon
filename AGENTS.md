@@ -201,6 +201,16 @@ LOG_LEVEL=INFO
 ## Agent Protocol
 - After making any functional changes or achieving progress, update this file to reflect the current state. Do not wait to be asked.
 
+## ABSOLUTE REQUIREMENT: No Future-Knowledge in Simulation
+The dry run simulation MUST NOT look ahead. At every evaluation point the simulator may only use information available at or before that timestamp.
+- `build_replay_plan()` MUST generate eval times from window fixed properties (`start_et`, `end_et`) only — never from market data.
+- `_build_context()` queries spot/order book with `timestamp <= eval_time` (strictly past-and-present).
+- `_check_dry_window()` iterates eval times chronologically; `stop_on_signal=True` MUST be set so the FIRST valid signal wins (not the "best" across the window).
+- `_simulate_fill()` queries order books with `timestamp <= eval_time`.
+- No strategy or engine code may scan a time band and retroactively select the optimal entry point.
+
+**Any new strategy must be audited for compliance before merging. Any refactor of the engine must preserve these guarantees.**
+
 ## Notes for Future Agents
 - Always use `session_scope()` context manager for DB transactions.
 - All timestamps are naive UTC stored in the DB; ET boundary semantics kept in `start_et` / `end_et`.
