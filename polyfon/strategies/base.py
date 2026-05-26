@@ -32,11 +32,20 @@ class Context:
     range_high: Optional[float] = None
     range_low: Optional[float] = None
 
+    # Intra-window mean spot price (for mean-reversion strategies like MPR).
+    mean_spot_price: Optional[float] = None
+
     # Token-specific book prices (resolves the UP/DOWN ambiguity).
     up_best_bid: Optional[float] = None
     up_best_ask: Optional[float] = None
     down_best_bid: Optional[float] = None
     down_best_ask: Optional[float] = None
+
+    # Token-specific book sizes (for order-book imbalance strategies).
+    up_bid_size: Optional[float] = None
+    up_ask_size: Optional[float] = None
+    down_bid_size: Optional[float] = None
+    down_ask_size: Optional[float] = None
 
 
 @dataclass

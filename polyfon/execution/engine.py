@@ -476,6 +476,19 @@ class ExecutionEngine:
                 ctx.range_high = row[0]
                 ctx.range_low = row[1]
 
+            # Mean spot price within the window (for MPR).
+            mean_result = await sess.execute(
+                select(func.avg(SpotPrice.price))
+                .where(
+                    SpotPrice.symbol == symbol,
+                    SpotPrice.timestamp >= window.start_et,
+                    SpotPrice.timestamp <= now,
+                )
+            )
+            mean_row = mean_result.scalar()
+            if mean_row is not None:
+                ctx.mean_spot_price = float(mean_row)
+
         # Order books at or before eval_time for historical alignment.
         async with session_scope() as sess:
             q_up = (
@@ -492,6 +505,8 @@ class ExecutionEngine:
             if ob_up:
                 ctx.up_best_bid = ob_up.best_bid
                 ctx.up_best_ask = ob_up.best_ask
+                ctx.up_bid_size = ob_up.bid_size
+                ctx.up_ask_size = ob_up.ask_size
 
         async with session_scope() as sess:
             q_down = (
@@ -508,6 +523,8 @@ class ExecutionEngine:
             if ob_down:
                 ctx.down_best_bid = ob_down.best_bid
                 ctx.down_best_ask = ob_down.best_ask
+                ctx.down_bid_size = ob_down.bid_size
+                ctx.down_ask_size = ob_down.ask_size
 
         # Backward compat: best_bid / best_ask default to UP token prices.
         ctx.best_bid = ctx.up_best_bid
