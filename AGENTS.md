@@ -93,6 +93,7 @@ polyfon/
         wdm.py                # Strategy: Window Delta Momentum
         tde.py                # Strategy: Time Decay Effect
         rom.py                # Strategy: Range Oscillation Momentum
+        pmr.py                # Strategy: Price Momentum Reversal
     execution/
         engine.py             # ExecutionEngine (dry/shadow mode)
     utils/
@@ -104,6 +105,7 @@ docs/
     wdm.md                 # WDM strategy reference
     tde.md                 # TDE strategy reference
     rom.md                 # ROM strategy reference
+    pmr.md                 # PMR strategy reference
 ```
 
 ## Execution Modes
@@ -195,7 +197,7 @@ LOG_LEVEL=INFO
 1. **Phase 1 (COMPLETE)**: Bootstrap — schema, config, WebSocket collectors, fair pricing, SLA strategy, dry mode, CLI.
 2. **Phase 2 (IN PROGRESS)**: Shadow mode refinement, session tracking, resolution engine (WS + API), orphan cleanup.
 3. **Phase 3**: Wet mode (CLOB API orders, private key). **POSTPONED.**
-4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM implemented. Remaining: PMR, MPR, VIT, CRV, OBI, VPX, CLL, HMM, MIP, PFR, RND, HPE, KLD, ARL, EVT.
+4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR implemented. Remaining: MPR, VIT, CRV, OBI, VPX, CLL, HMM, MIP, PFR, RND, HPE, KLD, ARL, EVT.
 5. **Phase 5**: Python ML bridge (GARCH, EVT, HMM, Hawkes) for advanced strategies.
 
 ## Agent Protocol
