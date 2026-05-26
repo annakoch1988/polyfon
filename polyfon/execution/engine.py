@@ -307,6 +307,9 @@ class ExecutionEngine:
         signaled_windows: int,
         filled_windows: int,
         total_trades: int,
+        simulation_time_sec: float | None = None,
+        sim_start: datetime | None = None,
+        sim_end: datetime | None = None,
     ) -> None:
         console = Console()
         console.print("")
@@ -318,6 +321,10 @@ class ExecutionEngine:
         console.print(f"  Windows filled:    {filled_windows}")
         console.print(f"  Total trades:      {total_trades}")
         console.print(f"  Total PnL:         {total_pnl:+.4f}")
+        if simulation_time_sec is not None:
+            console.print(f"  Simulation time:   {simulation_time_sec:.2f}s")
+        if sim_start and sim_end:
+            console.print(f"  Eval period:       {sim_start} — {sim_end}")
         console.print("-" * 72)
 
         n = len(trade_pnls)
@@ -754,6 +761,9 @@ class ExecutionEngine:
         filled_windows = 0
         total_trades = 0
         status = "completed"
+        run_start = datetime.now(timezone.utc)
+        sim_start = windows[0].start_et if windows else None
+        sim_end = windows[-1].end_et if windows else None
 
         try:
             for idx, w in enumerate(windows, start=1):
@@ -790,6 +800,7 @@ class ExecutionEngine:
             raise
 
         if self._running:
+            elapsed = (datetime.now(timezone.utc) - run_start).total_seconds()
             self._print_statistics(
                 trade_pnls=trade_pnls,
                 total_pnl=total_pnl,
@@ -797,6 +808,9 @@ class ExecutionEngine:
                 signaled_windows=signaled_windows,
                 filled_windows=filled_windows,
                 total_trades=total_trades,
+                simulation_time_sec=elapsed,
+                sim_start=sim_start,
+                sim_end=sim_end,
             )
 
         await self._finalize_dry_run_session(
