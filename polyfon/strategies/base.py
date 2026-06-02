@@ -51,6 +51,9 @@ class Context:
     leader_spot_price: Optional[float] = None
     leader_return: Optional[float] = None
 
+    # Short-term volatility (for VPX strategy).
+    sigma_short_per_minute: Optional[float] = None
+
 
 @dataclass
 class ReplayPlan:

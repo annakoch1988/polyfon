@@ -99,6 +99,7 @@ class ExecutionEngine:
         self.window_slugs = window_slugs or []
         self._running = False
         self._vols: Dict[str, RollingVolatility] = {}
+        self._vols_short: Dict[str, RollingVolatility] = {}
         self._dry_run_session_id: Optional[str] = None
 
     @staticmethod
@@ -233,6 +234,11 @@ class ExecutionEngine:
         if symbol not in self._vols:
             self._vols[symbol] = RollingVolatility(window=60, interval_sec=1.0)
         return self._vols[symbol]
+
+    def _get_or_create_vol_short(self, symbol: str) -> RollingVolatility:
+        if symbol not in self._vols_short:
+            self._vols_short[symbol] = RollingVolatility(window=10, interval_sec=1.0)
+        return self._vols_short[symbol]
 
     def _init_dry_report(self, window: Window) -> DryWindowReport:
         return DryWindowReport(
@@ -446,6 +452,9 @@ class ExecutionEngine:
                 vol = self._get_or_create_vol(symbol)
                 vol.update(sp.price)
                 ctx.sigma_per_minute = vol.sigma_per_minute
+                vol_short = self._get_or_create_vol_short(symbol)
+                vol_short.update(sp.price)
+                ctx.sigma_short_per_minute = vol_short.sigma_per_minute
 
         async with session_scope() as sess:
             spot_q = (
