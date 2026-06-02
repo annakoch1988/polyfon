@@ -98,6 +98,7 @@ polyfon/
         mpr.py                # Strategy: Mean Price Reversion
         vit.py                # Strategy: Volume-Spike Informed Trading
         crv.py               # Strategy: Cross-Contract Relative Value
+        cll.py               # Strategy: Cross-Asset Correlation Lead-Lag
     execution/
         engine.py             # ExecutionEngine (dry/shadow mode)
     utils/
@@ -114,6 +115,7 @@ docs/
     mpr.md                 # MPR strategy reference
     vit.md                 # VIT strategy reference
     crv.md                 # CRV strategy reference
+    cll.md                 # CLL strategy reference
 ```
 
 ## Execution Modes
@@ -193,6 +195,11 @@ python -m scripts.run dry --strategy=VIT
 python -m scripts.run dry --strategy=VIT --param imb_threshold=0.15 --param v_threshold=0.002
 python -m scripts.run shadow --strategy=VIT --collect
 
+# CLL examples
+python -m scripts.run dry --strategy=CLL
+python -m scripts.run dry --strategy=CLL --param theta_entry=0.02 --param rho=0.80
+python -m scripts.run shadow --strategy=CLL --collect
+
 # List strategies
 python -m scripts.run list-strategies
 ```
@@ -210,7 +217,7 @@ LOG_LEVEL=INFO
 1. **Phase 1 (COMPLETE)**: Bootstrap — schema, config, WebSocket collectors, fair pricing, SLA strategy, dry mode, CLI.
 2. **Phase 2 (IN PROGRESS)**: Shadow mode refinement, session tracking, resolution engine (WS + API), orphan cleanup.
 3. **Phase 3**: Wet mode (CLOB API orders, private key). **POSTPONED.**
-4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR, OBI, MPR, VIT, CRV implemented. Remaining: VPX, CLL, HMM, MIP, PFR, RND, HPE, KLD, ARL, EVT.
+4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL implemented. Remaining: VPX, HMM, MIP, PFR, RND, HPE, KLD, ARL, EVT.
 5. **Phase 5**: Python ML bridge (GARCH, EVT, HMM, Hawkes) for advanced strategies.
 
 ## Agent Protocol
@@ -250,6 +257,7 @@ The dry run simulation MUST NOT look ahead. At every evaluation point the simula
 - **TDE strategy** (`polyfon/strategies/tde.py`): Time Decay Effect. Entry at τ ∈ [15, 90]s when `|fair_prob - market_price| > theta_entry` AND the theta direction (∂π̂/∂τ) agrees that mispricing is widening. Stateless per-tick. Uses `up_best_ask` for BUY_YES, `down_best_ask` for BUY_NO. Computes theta analytically via `_theta()` — a closed-form derivative of the binary call formula. Documented in `docs/tde.md`.
 - **ROM strategy** (`polyfon/strategies/rom.py`): Range Oscillation Momentum. Entry at τ ∈ [30, 120]s when spot is in the top/bottom 20% of its intra-window range. Uses `context.range_high` and `context.range_low` (computed in `_build_context` via `func.max`/`func.min` on SpotPrice). Entry direction: near range-high → BUY_YES, near range-low → BUY_NO. Confidence = displacement confidence × range-quality factor. Documented in `docs/rom.md`.
 - **WDM strategy** (`polyfon/strategies/wdm.py`): Supplementary strategy, not part of the 18. Entry at T-10s based on spot displacement from window open price. Uses `up_best_ask` for BUY YES and `down_best_ask` for BUY NO. Confidence = min(|delta| / theta_sat, 1.0). Documented in `polymarket-strategies/window_delta_momentum_wdm.md`.
+- **CLL strategy** (`polyfon/strategies/cll.py`): Cross-Asset Correlation Lead-Lag. Entry when leader asset (e.g. BTC) moves significantly and the lagger's Polymarket contract has not repriced. Uses `lookback_seconds` return of leader to predict lagger spot via `beta_lead` coefficient. Fair probability adjusted using conditional volatility `σ_B|A = σ_B × √(1 - ρ²)`. Entry direction: `adjusted_prob > market_price → BUY_YES`, else `BUY_NO`. Documented in `docs/cll.md`.
 - **Context fields**: `window_open_price` (earliest spot in window range), `up_best_bid`/`up_best_ask`/`down_best_bid`/`down_best_ask` (per-token OrderBook), `up_bid_size`/`up_ask_size`/`down_bid_size`/`down_ask_size` (book sizes for OBI), `mean_spot_price` (intra-window mean for MPR). Backward compat: `best_bid`/`best_ask` default to UP token values.
 - **Book ambiguity fixed**: `_build_context` queries UP and DOWN OrderBooks separately by `token_id`. `_simulate_fill` uses `token_map` to look up the correct token's book based on signal direction.
 - **SLA improvement**: `fair_probability` now uses `window_open_price` as strike (was hardcoded 0.5).

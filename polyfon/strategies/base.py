@@ -47,6 +47,10 @@ class Context:
     down_bid_size: Optional[float] = None
     down_ask_size: Optional[float] = None
 
+    # Cross-asset lead-lag (for CLL strategy).
+    leader_spot_price: Optional[float] = None
+    leader_return: Optional[float] = None
+
 
 @dataclass
 class ReplayPlan:

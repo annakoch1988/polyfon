@@ -3,7 +3,7 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -529,6 +529,40 @@ class ExecutionEngine:
         # Backward compat: best_bid / best_ask default to UP token prices.
         ctx.best_bid = ctx.up_best_bid
         ctx.best_ask = ctx.up_best_ask
+
+        # Cross-asset lead-lag — query leader spot if configured on strategy.
+        leader = getattr(self.strategy, "leader", None)
+        if leader:
+            lookback = getattr(self.strategy, "lookback_seconds", 60)
+            async with session_scope() as sess:
+                result = await sess.execute(
+                    select(SpotPrice)
+                    .where(
+                        SpotPrice.symbol == leader.upper(),
+                        SpotPrice.timestamp <= now,
+                    )
+                    .order_by(desc(SpotPrice.timestamp))
+                    .limit(1)
+                )
+                sp_leader = result.scalar_one_or_none()
+                if sp_leader is not None:
+                    ctx.leader_spot_price = sp_leader.price
+                    # Return over the lookback window
+                    lag_time = now - timedelta(seconds=lookback)
+                    result = await sess.execute(
+                        select(SpotPrice)
+                        .where(
+                            SpotPrice.symbol == leader.upper(),
+                            SpotPrice.timestamp <= lag_time,
+                        )
+                        .order_by(desc(SpotPrice.timestamp))
+                        .limit(1)
+                    )
+                    sp_leader_old = result.scalar_one_or_none()
+                    if sp_leader_old is not None and sp_leader_old.price > 0:
+                        ctx.leader_return = (
+                            sp_leader.price - sp_leader_old.price
+                        ) / sp_leader_old.price
 
         # Fair probability — use window_open_price as strike if available.
         if ctx.spot_price:

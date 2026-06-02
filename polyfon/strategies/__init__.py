@@ -9,5 +9,6 @@ from polyfon.strategies.obi import OBIStrategy
 from polyfon.strategies.mpr import MPRStrategy
 from polyfon.strategies.vit import VITStrategy
 from polyfon.strategies.crv import CRVStrategy
+from polyfon.strategies.cll import CLLStrategy
 
-__all__ = ["BaseStrategy", "Context", "Signal", "StrategyRegistry", "register", "SLAStrategy", "WDMStrategy", "TDEStrategy", "ROMStrategy", "PMRStrategy", "OBIStrategy", "MPRStrategy", "VITStrategy", "CRVStrategy"]
+__all__ = ["BaseStrategy", "Context", "Signal", "StrategyRegistry", "register", "SLAStrategy", "WDMStrategy", "TDEStrategy", "ROMStrategy", "PMRStrategy", "OBIStrategy", "MPRStrategy", "VITStrategy", "CRVStrategy", "CLLStrategy"]
