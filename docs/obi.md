@@ -51,7 +51,7 @@ if abs(imbalance) < theta_entry:
 
 | Param | What it controls |
 |-------|------------------|
-| `theta_entry` | Minimum |imbalance| to consider a trade. Default 0.40. Lower → more signals at weaker pressure. Higher → fewer, higher-conviction signals. |
+| `theta_entry` | Minimum |imbalance| to consider a trade. Default 0.10. Lower → more signals at weaker pressure. Higher → fewer, higher-conviction signals. |
 
 ### Step 4 — Direction and order sizing
 
@@ -96,8 +96,8 @@ Linear ramp: imbalance = theta_sat gives full confidence.
 
 | Param | Default | Used in | Effect | Tuning |
 |-------|---------|---------|--------|--------|
-| `theta_entry` | 0.40 | Step 3 | Min |imbalance| to allow entry. | Grid search [0.20, 0.60]. |
-| `theta_sat` | 0.60 | Step 6 | |imbalance| magnitude at which confidence saturates. | Test 0.30–0.80. |
+| `theta_entry` | 0.10 | Step 3 | Min |imbalance| to allow entry. | Grid search [0.05, 0.30]. |
+| `theta_sat` | 0.30 | Step 6 | |imbalance| magnitude at which confidence saturates. | Test 0.10–0.50. |
 | `tau_max` | 120.0 s | Step 1 | Upper bound on entry timing. | Test 90–180s. |
 | `tau_min` | 15.0 s | Step 1 | Lower bound on entry timing. | Test 10–30s. |
 | `replay_cadence_seconds` | 1.0 s | Dry replay | Historical evaluation spacing inside the `[tau_min, tau_max]` band. | Test 1, 2, 5. |

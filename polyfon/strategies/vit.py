@@ -1,4 +1,4 @@
-"""Strategy: Order Book Imbalance (OBI)."""
+"""Strategy: Volume-Spike Informed Trading (VIT)."""
 from datetime import timedelta
 from typing import Any, Optional
 
@@ -7,49 +7,52 @@ from polyfon.utils.fees import taker_fee_usdc
 
 
 @register
-class OBIStrategy(BaseStrategy):
-    """Order Book Imbalance.
+class VITStrategy(BaseStrategy):
+    """Volume-Spike Informed Trading.
 
-    Exploits order-book micro-structure by measuring the ratio of bid to
-    ask sizes at the top of the book for the UP token.  A strong
-    imbalance toward the bid side indicates aggressive buy pressure
-    (market participants are lifting offers), while a strong imbalance
-    toward the ask side indicates selling pressure.
+    Detects informed trading activity by combining spot-price momentum
+    (proxy for unusual market activity) with order-book imbalance
+    (proxy for informed flow direction).  Both signals must agree before
+    the strategy enters.
 
-    The strategy is symmetric: it can enter YES (when buy pressure is
-    dominant) or NO (when sell pressure is dominant).
+    Adapted from the original VIT proposal which required per-trade
+    Polymarket volume data — here spot displacement from the window-open
+    price stands in for trade-volume spikes and order-book imbalance
+    replaces trade-sign Order Flow Imbalance (OFI).
 
-    Imbalance is computed on the UP token's book:
-        imbalance = (bid_size - ask_size) / (bid_size + ask_size)
-
-    Range: [-1, +1].  Positive → buy pressure → BUY_YES.
-    Negative → sell pressure → BUY_NO.
+    The "triple condition":
+      1. |spot displacement| > v_threshold  (activity spike)
+      2. |book imbalance|    > imb_threshold (informed direction)
+      3. sign(displacement) == sign(imbalance) (cross-validation)
 
     Parameters (empirically discoverable):
-        theta_entry:  Min |imbalance| to consider (default 0.10).
-                      Lower → more signals at weaker pressure.
-        theta_sat:    |imbalance| at which confidence saturates (default 0.30).
-        tau_max:      Latest entry before resolution (default 120s).
+        v_threshold:  Minimum |displacement| from open to trigger (default 0.001).
+        v_sat:        Displacement at which activity-confidence saturates (default 0.005).
+        imb_threshold: Minimum |imbalance| to confirm direction (default 0.10).
+        imb_sat:      |imbalance| at which direction-confidence saturates (default 0.30).
+        tau_max:      Latest entry before resolution (default 240s).
         tau_min:      Earliest entry before resolution (default 15s).
         q_max:        Position size.  For *market* class = USDC to spend;
                       for *limit* class = number of shares.
         theta_edge:   Minimum expected edge per share to trade.
         order_class:  'market' (default) or 'limit'.
         time_in_force: 'FOK' (default for market), 'FAK', 'GTC', 'GTD'.
-                       Market -> FOK or FAK.  Limit -> GTC or GTD.
+                       Market → FOK or FAK.  Limit → GTC or GTD.
         fee_rate:     Market taker fee rate.
     """
 
-    name = "OBI"
+    name = "VIT"
 
     _MARKET_TIF = frozenset({"FOK", "FAK"})
     _LIMIT_TIF = frozenset({"GTC", "GTD"})
 
     def __init__(
         self,
-        theta_entry: float = 0.10,
-        theta_sat: float = 0.30,
-        tau_max: float = 120.0,
+        v_threshold: float = 0.001,
+        v_sat: float = 0.005,
+        imb_threshold: float = 0.10,
+        imb_sat: float = 0.30,
+        tau_max: float = 240.0,
         tau_min: float = 15.0,
         replay_cadence_seconds: float = 1.0,
         q_max: float = 1.0,
@@ -66,8 +69,10 @@ class OBIStrategy(BaseStrategy):
                 f"time_in_force {time_in_force!r} invalid for {order_class} orders. "
                 f"Use {sorted(valid_tif)}"
             )
-        self.theta_entry = theta_entry
-        self.theta_sat = theta_sat
+        self.v_threshold = v_threshold
+        self.v_sat = v_sat
+        self.imb_threshold = imb_threshold
+        self.imb_sat = imb_sat
         self.tau_max = tau_max
         self.tau_min = tau_min
         self.replay_cadence_seconds = replay_cadence_seconds
@@ -78,7 +83,6 @@ class OBIStrategy(BaseStrategy):
         self.fee_rate = fee_rate
 
     def _resolve_order(self, price: float) -> tuple[float, float] | None:
-        """Return (shares, notional_usdc) or None if constraints fail."""
         if self.order_class == "market":
             usdc = self.q_max
             if usdc < 1.0:
@@ -90,8 +94,18 @@ class OBIStrategy(BaseStrategy):
                 return None
         return shares, shares * price
 
+    def _compute_imbalance(self, context: Context) -> Optional[float]:
+        bid_size = context.up_bid_size
+        ask_size = context.up_ask_size
+        if bid_size is None or ask_size is None or (bid_size + ask_size) <= 0:
+            bid_size = context.down_bid_size
+            ask_size = context.down_ask_size
+            if bid_size is None or ask_size is None or (bid_size + ask_size) <= 0:
+                return None
+        return (bid_size - ask_size) / (bid_size + ask_size)
+
     def on_tick(self, window: Any, context: Context) -> Optional[Signal]:
-        if context.spot_price is None:
+        if context.spot_price is None or context.window_open_price is None:
             return None
         if context.tau_seconds is None:
             return None
@@ -100,22 +114,16 @@ class OBIStrategy(BaseStrategy):
         if tau < self.tau_min or tau > self.tau_max:
             return None
 
-        # Compute imbalance from the UP token's book.
-        # Fall back to DOWN token if UP sizes are unavailable.
-        bid_size = context.up_bid_size
-        ask_size = context.up_ask_size
-        if bid_size is None or ask_size is None or (bid_size + ask_size) <= 0:
-            bid_size = context.down_bid_size
-            ask_size = context.down_ask_size
-            if bid_size is None or ask_size is None or (bid_size + ask_size) <= 0:
-                return None
+        displacement = (context.spot_price - context.window_open_price) / context.window_open_price
 
-        imbalance = (bid_size - ask_size) / (bid_size + ask_size)
-
-        if abs(imbalance) < self.theta_entry:
+        if abs(displacement) < self.v_threshold:
             return None
 
-        if imbalance > self.theta_entry and context.up_best_ask is not None:
+        imbalance = self._compute_imbalance(context)
+        if imbalance is None or abs(imbalance) < self.imb_threshold:
+            return None
+
+        if displacement > 0 and imbalance > 0 and context.up_best_ask is not None:
             price = context.up_best_ask
             resolved = self._resolve_order(price)
             if resolved is None:
@@ -124,7 +132,7 @@ class OBIStrategy(BaseStrategy):
             fee = taker_fee_usdc(shares, price, self.fee_rate)
             edge = (1.0 - price) - fee / shares
             if edge > self.theta_edge:
-                confidence = min(imbalance / self.theta_sat, 1.0)
+                confidence = min(abs(displacement) / self.v_sat, 1.0) * min(imbalance / self.imb_sat, 1.0)
                 return Signal(
                     strategy=self.name,
                     direction="BUY_YES",
@@ -132,15 +140,17 @@ class OBIStrategy(BaseStrategy):
                     expected_edge=float(edge),
                     confidence=float(min(confidence, 1.0)),
                     metadata={
+                        "displacement": displacement,
                         "imbalance": imbalance,
                         "tau": tau,
                         "order_class": self.order_class,
                         "time_in_force": self.time_in_force,
-                        "q_max": self.q_max, "notional": notional,
+                        "q_max": self.q_max,
+                        "notional": notional,
                     },
                 )
 
-        if imbalance < -self.theta_entry and context.down_best_ask is not None:
+        if displacement < 0 and imbalance < 0 and context.down_best_ask is not None:
             price = context.down_best_ask
             resolved = self._resolve_order(price)
             if resolved is None:
@@ -149,7 +159,7 @@ class OBIStrategy(BaseStrategy):
             fee = taker_fee_usdc(shares, price, self.fee_rate)
             edge = (1.0 - price) - fee / shares
             if edge > self.theta_edge:
-                confidence = min(-imbalance / self.theta_sat, 1.0)
+                confidence = min(abs(displacement) / self.v_sat, 1.0) * min(-imbalance / self.imb_sat, 1.0)
                 return Signal(
                     strategy=self.name,
                     direction="BUY_NO",
@@ -157,11 +167,13 @@ class OBIStrategy(BaseStrategy):
                     expected_edge=float(edge),
                     confidence=float(min(confidence, 1.0)),
                     metadata={
+                        "displacement": displacement,
                         "imbalance": imbalance,
                         "tau": tau,
                         "order_class": self.order_class,
                         "time_in_force": self.time_in_force,
-                        "q_max": self.q_max, "notional": notional,
+                        "q_max": self.q_max,
+                        "notional": notional,
                     },
                 )
 

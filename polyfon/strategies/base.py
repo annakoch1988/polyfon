@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -106,7 +106,24 @@ class StrategyRegistry:
             return None
         return strat_class(**kwargs)
 
+    @classmethod
+    def list_strategies_with_dates(cls) -> List[tuple[str, datetime]]:
+        """Return (name, registration_date) sorted oldest → newest.
+
+        The registration date is the first time the module defining the
+        strategy class was imported.  For strategies that pre-date this
+        attribute the default is the current UTC timestamp at import time.
+        """
+        return sorted(
+            (
+                (name, getattr(klass, "_registered_at", datetime.utcnow()))
+                for name, klass in cls._strategies.items()
+            ),
+            key=lambda x: x[1],
+        )
+
 
 def register(cls: type[BaseStrategy]) -> type[BaseStrategy]:
     """Decorator to register a strategy class."""
+    cls._registered_at = datetime.utcnow()
     return StrategyRegistry.add(cls)

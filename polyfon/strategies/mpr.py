@@ -28,8 +28,8 @@ class MPRStrategy(BaseStrategy):
     Negative deviation → spot below mean → expect reversion up → BUY_YES.
 
     Parameters (empirically discoverable):
-        theta_entry:  Min |deviation| from mean to consider entry (default 0.001).
-        theta_sat:    |deviation| at which confidence saturates (default 0.003).
+        theta_entry:  Min |deviation| from mean to consider entry (default 0.0002).
+        theta_sat:    |deviation| at which confidence saturates (default 0.0006).
         tau_max:      Latest entry before resolution (default 120s).
         tau_min:      Earliest entry before resolution (default 30s).
         q_max:        Position size.  For *market* class = USDC to spend;
@@ -48,8 +48,8 @@ class MPRStrategy(BaseStrategy):
 
     def __init__(
         self,
-        theta_entry: float = 0.001,
-        theta_sat: float = 0.003,
+        theta_entry: float = 0.0002,
+        theta_sat: float = 0.0006,
         tau_max: float = 120.0,
         tau_min: float = 30.0,
         replay_cadence_seconds: float = 1.0,

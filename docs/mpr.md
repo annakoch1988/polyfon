@@ -48,7 +48,7 @@ if abs(deviation) < theta_entry:
 
 | Param | What it controls |
 |-------|------------------|
-| `theta_entry` | Minimum |deviation| to consider entry. Default 0.001 (0.10%). |
+| `theta_entry` | Minimum |deviation| to consider entry. Default 0.0002 (0.02%). |
 
 ### Step 4 — Direction
 
@@ -87,8 +87,8 @@ Linear ramp of the deviation magnitude.
 
 | Param | Default | Used in | Effect | Tuning |
 |-------|---------|---------|--------|--------|
-| `theta_entry` | 0.001 (0.10%) | Step 3 | Min |deviation| from mean. | Grid search [0.0005, 0.002]. |
-| `theta_sat` | 0.003 (0.30%) | Step 6 | |deviation| at confidence saturation. | Test 0.002–0.005. |
+| `theta_entry` | 0.0002 (0.02%) | Step 3 | Min |deviation| from mean. | Grid search [0.0001, 0.0005]. |
+| `theta_sat` | 0.0006 (0.06%) | Step 6 | |deviation| at confidence saturation. | Test 0.0004–0.001. |
 | `tau_max` | 120.0 s | Step 1 | Upper bound on entry timing. | Test 90–180s. |
 | `tau_min` | 30.0 s | Step 1 | Lower bound on entry timing. | Test 15–60s. |
 | `replay_cadence_seconds` | 1.0 s | Dry replay | Eval spacing in `[tau_min, tau_max]`. | Test 1, 2, 5. |
@@ -108,7 +108,7 @@ python -m scripts.run dry --strategy=MPR
 
 # Tighter deviation threshold, wider timing
 python -m scripts.run dry --strategy=MPR \
-  --param theta_entry=0.0005 \
+  --param theta_entry=0.0003 \
   --param tau_max=150
 
 # Faster replay

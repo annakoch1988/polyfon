@@ -147,8 +147,13 @@ class PolymarketBookCollector:
                 best_bid = prev.get("best_bid")
             if best_ask is None and prev:
                 best_ask = prev.get("best_ask")
-            size = float(change["size"]) if change.get("size") is not None else None
-            record = self._update_state(asset_id, best_bid, best_ask, size, size)
+            # price_change events do not carry top-of-book bid/ask sizes.
+            # Preserve the previous sizes to avoid clobbering both with the
+            # same value (which would make order-book imbalance always 0).
+            prev = self._last.get(asset_id)
+            prev_bid_size = prev.get("bid_size") if prev else None
+            prev_ask_size = prev.get("ask_size") if prev else None
+            record = self._update_state(asset_id, best_bid, best_ask, prev_bid_size, prev_ask_size)
             self._emit(asset_id, record)
 
     def _handle_best_bid_ask(self, payload: Dict[str, Any]) -> None:

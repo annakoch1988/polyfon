@@ -7,5 +7,7 @@ from polyfon.strategies.rom import ROMStrategy
 from polyfon.strategies.pmr import PMRStrategy
 from polyfon.strategies.obi import OBIStrategy
 from polyfon.strategies.mpr import MPRStrategy
+from polyfon.strategies.vit import VITStrategy
+from polyfon.strategies.crv import CRVStrategy
 
-__all__ = ["BaseStrategy", "Context", "Signal", "StrategyRegistry", "register", "SLAStrategy", "WDMStrategy", "TDEStrategy", "ROMStrategy", "PMRStrategy", "OBIStrategy", "MPRStrategy"]
+__all__ = ["BaseStrategy", "Context", "Signal", "StrategyRegistry", "register", "SLAStrategy", "WDMStrategy", "TDEStrategy", "ROMStrategy", "PMRStrategy", "OBIStrategy", "MPRStrategy", "VITStrategy", "CRVStrategy"]
