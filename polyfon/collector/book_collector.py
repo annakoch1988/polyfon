@@ -118,6 +118,9 @@ class PolymarketBookCollector:
         """Handle full orderbook snapshot event."""
         asset_id = payload.get("asset_id", "")
         if not asset_id:
+            if self._unknown_messages_logged < 10:
+                logger.warning("Book WS book payload missing asset_id payload=%r", payload)
+                self._unknown_messages_logged += 1
             return
         bids = payload.get("bids", [])
         asks = payload.get("asks", [])
@@ -135,7 +138,13 @@ class PolymarketBookCollector:
 
         Contains an array of price_changes; each has best_bid / best_ask.
         """
-        for change in payload.get("price_changes", []):
+        changes = payload.get("price_changes", [])
+        if not isinstance(changes, list):
+            if self._unknown_messages_logged < 10:
+                logger.warning("Book WS price_change payload has non-list price_changes payload=%r", payload)
+                self._unknown_messages_logged += 1
+            return
+        for change in changes:
             asset_id = change.get("asset_id", "")
             if not asset_id:
                 continue
@@ -163,6 +172,9 @@ class PolymarketBookCollector:
         """Handle direct best_bid_ask event."""
         asset_id = payload.get("asset_id", "")
         if not asset_id:
+            if self._unknown_messages_logged < 10:
+                logger.warning("Book WS best_bid_ask payload missing asset_id payload=%r", payload)
+                self._unknown_messages_logged += 1
             return
         bb = payload.get("best_bid")
         ba = payload.get("best_ask")
@@ -175,6 +187,9 @@ class PolymarketBookCollector:
         """Handle last_trade_price event."""
         asset_id = payload.get("asset_id", "")
         if not asset_id:
+            if self._unknown_messages_logged < 10:
+                logger.warning("Book WS last_trade_price payload missing asset_id payload=%r", payload)
+                self._unknown_messages_logged += 1
             return
         price = payload.get("price")
         ltp = float(price) if price is not None else None
@@ -205,7 +220,7 @@ class PolymarketBookCollector:
                     record.get("stale", False),
                 )
             except Exception:
-                pass  # Don't let callback failures kill the collector
+                logger.exception("Book WS on_book callback failed for asset_id=%s record=%r", asset_id, record)
 
     # ---- WebSocket lifecycle ------------------------------------------------
 
@@ -336,6 +351,14 @@ class PolymarketBookCollector:
             return
 
         payload = msg.get("message") if isinstance(msg.get("message"), dict) else msg
+
+        # Some Polymarket frames may wrap the actual event in a nested list
+        # under "message" or send a list-shaped payload directly.
+        if isinstance(payload, list):
+            for item in payload:
+                await self._handle_message(item)
+            return
+
         event_type = payload.get("event_type") or payload.get("type")
         if event_type == "book":
             self._handle_book(payload)
@@ -373,6 +396,7 @@ class PolymarketBookCollector:
     # ---- public API ----------------------------------------------------------
 
     def start(self, asset_ids: list[str]) -> None:
+        logger.info("Book WS start requested for %d assets", len(asset_ids))
         self._running = True
         self._assets_ids = list(asset_ids)
         self._task = asyncio.create_task(self._consume())
@@ -390,6 +414,13 @@ class PolymarketBookCollector:
             old_ids = set(self._assets_ids)
             new_ids = set(asset_ids)
             self._assets_ids = list(asset_ids)
+            logger.info(
+                "Book WS update_assets old=%d new=%d removed=%d added=%d",
+                len(old_ids),
+                len(new_ids),
+                len(old_ids - new_ids),
+                len(new_ids - old_ids),
+            )
 
             # If tokens were removed, force reconnect (additive-only protocol)
             if old_ids and not new_ids.issuperset(old_ids):

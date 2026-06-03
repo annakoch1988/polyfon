@@ -263,6 +263,7 @@ class CollectionOrchestrator:
                     continue
                 all_ids.extend([win.up_token_id, win.down_token_id])
         all_ids = list(set(all_ids))
+        logger.info("Refreshing book subscription with %d token ids", len(all_ids))
         if all_ids:
             if self._book_active_tokens and set(all_ids) != self._book_active_tokens:
                 await self.book.update_assets(all_ids)
@@ -635,26 +636,16 @@ class CollectionOrchestrator:
             msg += f"  |  Next boundary in {wait_sec:.0f}s at {_fmt_et(next_boundary)}[/]"
             console.print(msg)
 
-        self.spot.start()
-
-        # Start book collector immediately so it can receive
-        # market_resolved events even during the mid-window wait.
-        async with session_scope() as sess:
-            result = await sess.execute(
-                select(Window).where(
-                    Window.status.in_(["pending", "open"]),
-                    Window.underlying.in_(self.coins),
-                )
-            )
-            initial_ids = [t for w in result.scalars() for t in (w.up_token_id, w.down_token_id)]
-        if initial_ids:
-            self.book.start(initial_ids)
-            self._book_active_tokens = set(initial_ids)
-
         self._tasks.append(asyncio.create_task(self._spot_worker()))
         self._tasks.append(asyncio.create_task(self._book_worker()))
         self._tasks.append(asyncio.create_task(self._window_manager()))
         self._tasks.append(asyncio.create_task(self._spot_open_watchdog()))
+
+        self.spot.start()
+
+        # Start / refresh book collector only after the background DB workers
+        # are running, so incoming book updates can be persisted immediately.
+        await self._refresh_book_subscription()
 
         ticks = 0
         while self._running:
