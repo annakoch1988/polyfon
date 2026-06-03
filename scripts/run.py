@@ -1,6 +1,7 @@
 """CLI entry point for polyfon."""
 import asyncio
 import inspect
+import logging
 
 import click
 from rich.console import Console
@@ -13,6 +14,15 @@ from polyfon.strategies.base import StrategyRegistry
 from polyfon.execution.engine import ExecutionEngine
 
 console = Console()
+
+
+def _configure_logging() -> None:
+    level_name = str(settings.log_level).upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 def _parse_coins(coins_str: str) -> list[str]:
@@ -75,7 +85,7 @@ def _run_async_command(coro, shutdown_message: str) -> None:
 @click.group()
 def cli():
     """Polyfon — 5-minute crypto prediction market trading system."""
-    pass
+    _configure_logging()
 
 
 @cli.command()
