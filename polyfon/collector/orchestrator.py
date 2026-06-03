@@ -271,6 +271,7 @@ class CollectionOrchestrator:
                 self.book.start(all_ids)
             self._book_active_tokens = set(all_ids)
         else:
+            logger.warning("No active Polymarket token ids available yet; book collector not started")
             self._book_active_tokens = set()
 
     async def _book_worker(self) -> None:
@@ -332,6 +333,8 @@ class CollectionOrchestrator:
         """Discover events and upsert Window records."""
         now_n = self._naive_utc(self._clock.now_utc())
         events = await self.discovery.discover_crypto_5min(coins=self.coins)
+        if not events:
+            logger.warning("Polymarket discovery returned no windows for coins=%s", ",".join(self.coins))
 
         async with session_scope() as sess:
             for ev in events:

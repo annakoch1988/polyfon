@@ -6,6 +6,7 @@ with both UP/DOWN token IDs, rather than one record per token.
 from __future__ import annotations
 
 import json as _json
+import logging
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
@@ -14,9 +15,11 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from zoneinfo import ZoneInfo
+from polyfon.config import settings
 
 ET_TZ = ZoneInfo("America/New_York")
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
+logger = logging.getLogger(__name__)
 
 _SERIES_SLUGS = [
     "btc-up-or-down-5m",
@@ -281,6 +284,7 @@ class PolymarketDiscovery:
         all_results: List[Dict[str, Any]] = []
 
         coin_list = coins or ["BTC", "ETH"]
+        logger.info("Polymarket discovery: coins=%s lookahead=%d", ",".join(coin_list), lookahead)
         now_et = datetime.now(timezone.utc).astimezone(ET_TZ)
 
         # Anchor discovery on the current ET 5-minute slot boundary so the
@@ -309,6 +313,7 @@ class PolymarketDiscovery:
                 if normalised:
                     all_results.append(normalised)
 
+        logger.info("Polymarket discovery returned %d windows", len(all_results))
         return all_results
 
     async def _fetch_event_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
@@ -318,5 +323,5 @@ class PolymarketDiscovery:
             if isinstance(data, list) and data:
                 return data[0]
         except Exception:
-            pass
+            logger.exception("Polymarket discovery fetch failed for slug=%s", slug)
         return None
