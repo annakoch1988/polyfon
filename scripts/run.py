@@ -23,6 +23,20 @@ def _configure_logging() -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    verbosity = str(settings.log_verbosity).lower().strip()
+    if verbosity not in {"minimal", "normal", "debug"}:
+        verbosity = "minimal"
+
+    if verbosity == "minimal":
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("websockets.client").setLevel(logging.WARNING)
+        logging.getLogger("polyfon.collector.market_discovery").setLevel(logging.WARNING)
+    elif verbosity == "normal":
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("websockets.client").setLevel(logging.INFO)
+        logging.getLogger("polyfon.collector.market_discovery").setLevel(logging.INFO)
 
 
 def _parse_coins(coins_str: str) -> list[str]:

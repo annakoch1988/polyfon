@@ -61,7 +61,14 @@ POLYMARKET_API_URL=https://clob.polymarket.com
 BINANCE_WS_URL=wss://stream.binance.com:9443/ws
 COINS=BTC,ETH
 LOG_LEVEL=INFO
+LOG_VERBOSITY=minimal
 ```
+
+`LOG_VERBOSITY` controls how noisy runtime logs are:
+
+- `minimal` — suppress chatty dependency logs like `httpx` request lines; recommended default
+- `normal` — keep Polyfon collector info logs while still suppressing low-level HTTP chatter
+- `debug` — leave all configured loggers at the configured `LOG_LEVEL`
 
 ### Optional: SOCKS5 proxy support
 

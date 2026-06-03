@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     binance_ws_url: str = "wss://stream.binance.com:9443/ws"
     coins: str = "BTC,ETH"
     log_level: str = "INFO"
+    log_verbosity: str = "minimal"
     socks5_proxy_url: str | None = Field(default=None)
     polymarket_ws_proxy_url: str | None = None
     polymarket_http_proxy_url: str | None = None
