@@ -89,6 +89,7 @@ Notes:
 - `BINANCE_WS_PROXY_URL` is used for Binance spot websocket traffic.
 - Proxy URLs should typically look like `socks5://host:port` or `socks5h://host:port`.
 - If only Polymarket is blocked from your region, prefer setting only `POLYMARKET_WS_PROXY_URL` and `POLYMARKET_HTTP_PROXY_URL` so Binance stays direct.
+- SOCKS websocket support requires the `python-socks` package. It is included in project dependencies; if you installed before this change, run `pip install -e .` again.
 
 ---
 

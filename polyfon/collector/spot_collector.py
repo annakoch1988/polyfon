@@ -99,6 +99,16 @@ class BinanceSpotCollector:
                         logger.exception("Spot disconnect callback failed")
                 await asyncio.sleep(5)
             except Exception as exc:
+                if proxy and "python-socks" in str(exc):
+                    logger.warning(
+                        "Binance WS SOCKS proxy support is unavailable: install dependency 'python-socks'"
+                    )
+                    console.print(
+                        "  [bold red]BINANCE WS PROXY ERROR[/] missing dependency [bold]python-socks[/] "
+                        f"for proxy [dim]{proxy}[/]"
+                    )
+                    await asyncio.sleep(5)
+                    continue
                 logger.warning("Binance WS error: %s", exc)
                 if self._running and self.on_disconnect:
                     try:
