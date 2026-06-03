@@ -12,7 +12,7 @@ Polyfon is a Python-based trading infrastructure designed to discover, collect, 
 - **SQLite database** — single-file, portable, no external daemon
 - **SQLAlchemy 2.0 async ORM** — type-safe async database operations
 - **Pluggable strategy framework** — `@register` decorator + `BaseStrategy` interface
-- **18+ strategy slots** — SLA, WDM, TDE, ROM implemented; 14 more planned
+- **18+ strategy slots** — 12 implemented (SLA, WDM, TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX, HMM); 6 more planned
 - **Replay plans** — each strategy defines its own dry-mode evaluation cadence
 - **Accurate fee modeling** — Polymarket taker fees per official documentation
 - **Realized PnL reporting** — dry mode fetches resolved Windows and computes net PnL
@@ -69,6 +69,25 @@ LOG_VERBOSITY=minimal
 - `minimal` — suppress chatty dependency logs like `httpx` request lines; recommended default
 - `normal` — keep Polyfon collector info logs while still suppressing low-level HTTP chatter
 - `debug` — leave all configured loggers at the configured `LOG_LEVEL`
+
+### `.env` Reference
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `DATABASE_URL` | str | `sqlite+aiosqlite:///./polyfon.db` | SQLite database connection string |
+| `POLYMARKET_API_URL` | str | `https://clob.polymarket.com` | Polymarket CLOB REST API base URL |
+| `BINANCE_WS_URL` | str | `wss://stream.binance.com:9443/ws` | Binance WebSocket stream base URL |
+| `COINS` | str | `BTC,ETH` | Comma-separated coin symbols to track |
+| `LOG_LEVEL` | str | `INFO` | Root logger level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `LOG_VERBOSITY` | str | `minimal` | Controls dependency log noise: `minimal`, `normal`, `debug` |
+| `SOCKS5_PROXY_URL` | str | — | Global SOCKS5 proxy fallback for all outbound traffic |
+| `POLYMARKET_WS_PROXY_URL` | str | — | SOCKS5 proxy override for Polymarket WebSocket only |
+| `POLYMARKET_HTTP_PROXY_URL` | str | — | SOCKS5 proxy override for Polymarket HTTP only |
+| `BINANCE_WS_PROXY_URL` | str | — | SOCKS5 proxy override for Binance WebSocket only |
+| `BINANCE_SILENCE_THRESHOLD_SEC` | float | `5.0` | Seconds without Binance tick before window is invalidated |
+| `DISCOVERY_HORIZON_MINUTES` | int | `720` | How far ahead to discover/scan upcoming windows |
+| `CLOCK_SOURCE` | str | `system` | Clock sync source: `system` or `binance` |
+| `CLOCK_SYNC_INTERVAL_SEC` | int | `60` | How often to resync clock when `CLOCK_SOURCE=binance` |
 
 ### Optional: SOCKS5 proxy support
 
@@ -141,7 +160,7 @@ Options:
 
 | Flag | Description |
 |------|-------------|
-| `--strategy` | Strategy name (`SLA`, `WDM`, `TDE`, `ROM`) |
+| `--strategy` | Strategy name (`SLA`, `WDM`, `TDE`, `ROM`, `PMR`, `OBI`, `MPR`, `VIT`, `CRV`, `CLL`, `VPX`, `HMM`) |
 | `--coins` | Comma-separated coin filter |
 | `--collect` | Also run live data collection in parallel |
 | `--window-slugs` | Comma-separated window slugs to restrict execution |
@@ -254,6 +273,14 @@ If `spot_prices` grows but `order_books` does not, capture the collector console
 | **WDM** | Window Delta Momentum — entry at T-10s based on spot displacement from open |
 | **TDE** | Time Decay Effect — entry when fair-probability theta agrees mispricing is widening |
 | **ROM** | Range Oscillation Momentum — entry when spot is in top/bottom 20% of intra-window range |
+| **PMR** | Price Momentum Reversal — entry on momentum exhaustion with volatility filter |
+| **OBI** | Order Book Imbalance — entry when order-book imbalance signals directional pressure |
+| **MPR** | Mean Price Reversion — entry when spot deviates from intra-window mean |
+| **VIT** | Volume-Spike Informed Trading — entry on spot volume spikes above threshold |
+| **CRV** | Cross-Contract Relative Value — entry when correlated contracts diverge |
+| **CLL** | Cross-Asset Correlation Lead-Lag — entry when leader moves but lagger hasn't repriced |
+| **VPX** | CEX Toxicity Volatility Indicator — entry on volatility regime shifts detected by VPX ratio |
+| **HMM** | Hidden Markov Model Regime-Switching — regime-aware entry inferred from market features |
 
 Each strategy has its own `ReplayPlan` that defines when `on_tick` is evaluated during dry mode:
 
@@ -263,6 +290,14 @@ Each strategy has its own `ReplayPlan` that defines when `on_tick` is evaluated 
 | WDM | Evaluates at T-10s |
 | TDE | Scans τ ∈ [15, 90]s |
 | ROM | Scans τ ∈ [30, 120]s |
+| PMR | Scans τ ∈ [30, `tau_max`]s |
+| OBI | Scans τ ∈ [30, `tau_max`]s |
+| MPR | Scans τ ∈ [30, `tau_max`]s |
+| VIT | Scans τ ∈ [30, `tau_max`]s |
+| CRV | Evaluates at T-30s |
+| CLL | Scans τ ∈ [τ_min, 120]s |
+| VPX | Scans τ ∈ [60, 240]s |
+| HMM | Scans τ ∈ [60, 240]s |
 
 Add a new strategy by creating `polyfon/strategies/<name>.py`, inheriting `BaseStrategy`, decorating with `@register`, and importing in `polyfon/strategies/__init__.py`.
 
@@ -328,7 +363,7 @@ Implemented in `polyfon/utils/fees.py`: `taker_fee_usdc()`, `net_pnl()`.
 | Phase 1 | ✅ Complete | Bootstrap: schema, config, WebSocket collectors, fair pricing, SLA, dry mode, CLI |
 | Phase 2 | ✅ Complete | Shadow mode refinement, session tracking, resolution engine, orphan cleanup |
 | Phase 3 | ⏸️ Postponed | Wet mode: real CLOB API orders |
-| Phase 4 | 🔄 In Progress | Additional strategies: TDE, ROM implemented; 14 remaining (PMR, MPR, VIT, CRV, OBI, VPX, CLL, HMM, MIP, PFR, RND, HPE, KLD, ARL, EVT) |
+| Phase 4 | 🔄 In Progress | Additional strategies: 12/18 implemented (SLA, WDM, TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX, HMM); 6 remaining (MIP, PFR, RND, HPE, KLD, ARL, EVT) |
 | Phase 5 | 📝 Planned | ML bridge: GARCH volatility, EVT, HMM, Hawkes processes |
 
 ---
