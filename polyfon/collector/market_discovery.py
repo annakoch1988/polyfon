@@ -49,43 +49,52 @@ class PolymarketDiscovery:
     async def _series_events(
         self, series_slug: str, closed: bool = False, limit: int = 100, skip: int = 0
     ) -> List[Dict[str, Any]]:
-        """Fetch events, paginating until we find relevant (recent) ones.
+        """Fetch the single page of events for this series.
 
-        The Gamma API can return thousands of stale events first, so we
-        keep requesting pages until we either find events that pass
-        ``_is_relevant_now`` or exhaust the result set.
+        The Gamma API caps responses at 100 events and pagination (skip)
+        wraps around instead of returning new pages.  We fetch one page
+        and return every event whose end time is within a sane lookahead
+        window (now – 1 hour  →  now + settings.discovery_horizon_minutes),
+        so the caller can discover the next few windows without spamming
+        the console for hours ahead.
         """
-        results: list = []
+        try:
+            page = await self._get(
+                "/events",
+                params={
+                    "series_slug": series_slug,
+                    "closed": closed,
+                    "limit": limit,
+                    "skip": skip,
+                },
+            )
+        except Exception:
+            return []
+        if not isinstance(page, list):
+            return []
+
+        from polyfon.config import settings
         now = datetime.now(timezone.utc)
-        while True:
-            try:
-                page = await self._get(
-                    "/events",
-                    params={
-                        "series_slug": series_slug,
-                        "closed": closed,
-                        "limit": limit,
-                        "skip": skip,
-                    },
-                )
-            except Exception:
-                return results
-            if not isinstance(page, list) or not page:
-                return results
-            for ev in page:
+        horizon = timedelta(minutes=max(5, int(settings.discovery_horizon_minutes)))
+        results: list = []
+        for ev in page:
+            # Prefer end time from slug; fallback to parsing endDate as ET
+            end_utc = self._end_from_slug((ev.get("markets") or [{}])[0].get("slug") or ev.get("slug", ""))
+            if end_utc is None:
                 end_str = ev.get("endDate")
-                if end_str:
-                    try:
-                        end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-                    except Exception:
-                        continue
-                    if end >= now - timedelta(hours=1):
-                        results.append(ev)
-            if any(self._is_relevant_now(ev) for ev in page):
-                return results
-            skip += limit
-            if skip > 2000:
-                return results
+                if not end_str:
+                    continue
+                try:
+                    # Polymarket endDate strings are ET clock times with trailing 'Z'.
+                    # Interpret as ET then convert to UTC.
+                    et_naive = datetime.fromisoformat(end_str.replace("Z", ""))
+                    et_aware = et_naive.replace(tzinfo=ET_TZ)
+                    end_utc = et_aware.astimezone(timezone.utc).replace(tzinfo=None)
+                except Exception:
+                    continue
+            if now - timedelta(hours=1) <= end_utc <= now + horizon:
+                results.append(ev)
+        return results
 
     # --- helpers ---------------------------------------------------------------
 
@@ -116,6 +125,21 @@ class PolymarketDiscovery:
             return datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)
         return None
 
+    @staticmethod
+    def _parse_iso_utc(value: Any) -> Optional[datetime]:
+        """Parse a Polymarket/Gamma ISO datetime as naive UTC.
+
+        Gamma timing fields such as ``eventStartTime`` and ``endDate`` are UTC
+        instants with a trailing ``Z``. Store all DB-facing timestamps as naive
+        UTC to match the rest of the project.
+        """
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return None
+
     # --- normalisation --------------------------------------------------------
 
     def _normalise(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -141,23 +165,26 @@ class PolymarketDiscovery:
 
         tick_size = float(market0.get("orderPriceMinTickSize", 0.01))
 
-        # Parse end time — Polymarket ET-based ISO string → UTC internally
-        end_str = event.get("endDate")
-        end_utc: Optional[datetime] = None
-        if end_str:
-            try:
-                dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-                # Convert to UTC for storage, keep the ET boundary semantics
-                end_utc = dt.astimezone(timezone.utc).replace(tzinfo=None)
-            except Exception:
-                pass
-        if end_utc is None:
-            end_utc = self._end_from_slug(slug)
+        # Timing: prefer explicit UTC fields from Gamma.
+        # For recurring 5-minute markets these reflect the true UTC window
+        # boundaries and are more reliable than reverse-engineering the slug.
+        event_start = event.get("eventStartTime") or market0.get("eventStartTime")
+        start_utc = self._parse_iso_utc(event_start)
 
+        end_str = market0.get("endDate") or event.get("endDate")
+        end_utc = self._parse_iso_utc(end_str)
+
+        # Fallback for older payloads that may omit explicit timing fields.
         if end_utc is None:
+            slug_end = self._end_from_slug(slug)
+            if slug_end is not None:
+                end_utc = slug_end.replace(tzinfo=None)
+
+        if start_utc is None and end_utc is not None:
+            start_utc = end_utc - timedelta(minutes=5)
+
+        if start_utc is None or end_utc is None:
             return None
-
-        start_utc = end_utc - timedelta(minutes=5)
 
         return {
             "slug": slug,
@@ -174,16 +201,31 @@ class PolymarketDiscovery:
 
     @staticmethod
     def _is_relevant_now(event: Dict[str, Any]) -> bool:
-        """Keep events whose window hasn't closed yet (+ keep future ones)."""
-        end_str = event.get("endDate")
-        if not end_str:
-            return False
-        try:
-            end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
-        except Exception:
-            return False
+        """Keep events whose window hasn't closed yet (+ upcoming ones soon).
+
+        The upper bound is governed by settings.discovery_horizon_minutes.
+        """
+        # Compute end time as in _series_events(): prefer slug, else ET endDate
+        slug = None
+        mkt = event.get("markets")
+        if isinstance(mkt, list) and mkt:
+            slug = mkt[0].get("slug")
+        if not slug:
+            slug = event.get("slug")
+        end_utc = PolymarketDiscovery._end_from_slug(slug) if slug else None
+        if end_utc is None:
+            end_str = event.get("endDate")
+            if end_str:
+                try:
+                    et_naive = datetime.fromisoformat(end_str.replace("Z", ""))
+                    et_aware = et_naive.replace(tzinfo=ET_TZ)
+                    end_utc = et_aware.astimezone(timezone.utc)
+                except Exception:
+                    end_utc = None
+        from polyfon.config import settings
         now = datetime.now(timezone.utc)
-        return now - timedelta(minutes=5) <= end <= now + timedelta(minutes=30)
+        horizon = timedelta(minutes=max(5, int(settings.discovery_horizon_minutes)))
+        return now - timedelta(minutes=5) <= end_utc <= now + horizon
 
     async def fetch_resolution(self, slug: str) -> Optional[str]:
         """Return ``"Yes"`` or ``"No"`` if the event has been resolved, else ``None``."""
@@ -225,31 +267,53 @@ class PolymarketDiscovery:
 
     # --- public API -----------------------------------------------------------
 
-    async def discover_crypto_5min(self, coins: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    async def discover_crypto_5min(self, coins: Optional[List[str]] = None, lookahead: int = 6) -> List[Dict[str, Any]]:
         """Discover active + upcoming 5-min crypto markets.
+
+        Generates window slugs from ET clock boundaries and queries Gamma
+        API individually by slug (bypasses broken _series_events pagination).
 
         Returns one dict per event (not per token_id).
         """
         all_results: List[Dict[str, Any]] = []
 
-        slug_map = {"BTC": "btc-up-or-down-5m", "ETH": "eth-up-or-down-5m"}
-        slugs = [slug_map[c] for c in (coins or ["BTC", "ETH"]) if c in slug_map]
+        coin_list = coins or ["BTC", "ETH"]
+        now_et = datetime.now(timezone.utc).astimezone(ET_TZ)
 
-        for series_slug in slugs:
-            series = await self._series_info(series_slug)
-            if not series:
-                continue
+        # Anchor discovery on the current ET 5-minute slot boundary so the
+        # currently-opening window is included as the first candidate.
+        slot_boundary = now_et.replace(
+            minute=(now_et.minute // 5) * 5,
+            second=0,
+            microsecond=0,
+        )
 
-            events = await self._series_events(
-                series_slug, closed=False, limit=1000, skip=0
+        for coin in coin_list:
+            prefix = {"BTC": "btc-updown-5m", "ETH": "eth-updown-5m"}.get(
+                coin, f"{coin.lower()}-updown-5m"
             )
-            if not events:
-                continue
 
-            for event in events:
-                if self._is_relevant_now(event):
-                    normalised = self._normalise(event)
-                    if normalised:
-                        all_results.append(normalised)
+            for i in range(lookahead):
+                # Window i spans [slot_boundary + i*5m, slot_boundary + (i+1)*5m].
+                window_end_et = slot_boundary + timedelta(minutes=(i + 1) * 5)
+                end_ts = int(window_end_et.timestamp())
+                slug = f"{prefix}-{end_ts}"
+
+                event = await self._fetch_event_by_slug(slug)
+                if event is None:
+                    continue
+                normalised = self._normalise(event)
+                if normalised:
+                    all_results.append(normalised)
 
         return all_results
+
+    async def _fetch_event_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single Gamma event by slug."""
+        try:
+            data = await self._get("/events", params={"slug": slug})
+            if isinstance(data, list) and data:
+                return data[0]
+        except Exception:
+            pass
+        return None

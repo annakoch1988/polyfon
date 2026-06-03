@@ -9,6 +9,7 @@ WebSocket endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
 import asyncio
 import json
 import logging
+import traceback
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional, Any
 
@@ -61,6 +62,8 @@ class PolymarketBookCollector:
         self._last: Dict[str, Dict[str, Any]] = {}
         self._last_seen: Dict[str, datetime] = {}
         self._lock = asyncio.Lock()
+        self._expected_close = False
+        self._unknown_messages_logged = 0
 
     # ---- state management ---------------------------------------------------
 
@@ -220,27 +223,39 @@ class PolymarketBookCollector:
         }
 
     async def _consume(self) -> None:
-        """Main WebSocket connection + consume loop."""
+        """Main WebSocket connection + consume loop.
+
+        Uses ``async for`` (reconnect iterator) instead of ``async with``,
+        so the websockets library itself handles reconnection with
+        exponential backoff on transient failures.
+
+        The custom ``_pinger`` task and ``on_disconnect`` callback are
+        kept for compatibility with the orchestrator's invalidation logic.
+        """
+        from websockets.asyncio.client import connect as ws_connect
+
         while self._running:
             try:
-                async with websockets.connect(
+                async for ws in ws_connect(
                     self.WS_URL,
-                    ping_interval=None,  # We handle pings manually per docs
+                    ping_interval=None,
                     close_timeout=5,
-                ) as ws:
+                    open_timeout=10,
+                ):
                     self._ws = ws
-                    # Subscribe to current assets
+                    logger.debug("Book WS: connected, subscribing %d assets", len(self._assets_ids))
                     async with self._lock:
                         if self._assets_ids:
                             await ws.send(json.dumps(self._subscribe_message(self._assets_ids)))
 
-                    # Start ping task
                     ping_task = asyncio.create_task(self._pinger(ws))
-
+                    logger.debug("Book WS: starting consume loop")
                     try:
-                        async for raw in ws:
-                            if not self._running:
-                                break
+                        while self._running:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                            except asyncio.TimeoutError:
+                                continue
                             try:
                                 msg = json.loads(raw)
                                 await self._handle_message(msg)
@@ -248,29 +263,42 @@ class PolymarketBookCollector:
                                 continue
                             except Exception:
                                 continue
+                    except ConnectionClosed as exc:
+                        logger.warning("Book WS ConnectionClosed: %s", exc)
+                        expected_close = self._expected_close
+                        self._expected_close = False
+                        if self._running and self.on_disconnect and not expected_close:
+                            try:
+                                self.on_disconnect(list(self._assets_ids), datetime.now(timezone.utc), f"book_disconnect:{type(exc).__name__}")
+                            except Exception:
+                                logger.exception("Book disconnect callback failed")
+                    except Exception as exc:
+                        logger.warning("Book WS exception in recv: %s %s", type(exc).__name__, exc)
+                        if self._running and self.on_disconnect:
+                            try:
+                                self.on_disconnect(list(self._assets_ids), datetime.now(timezone.utc), f"book_disconnect:{type(exc).__name__}")
+                            except Exception:
+                                logger.exception("Book disconnect callback failed")
                     finally:
                         ping_task.cancel()
                         try:
                             await ping_task
                         except asyncio.CancelledError:
                             pass
-
-            except ConnectionClosed as exc:
-                if self._running and self.on_disconnect:
-                    try:
-                        self.on_disconnect(list(self._assets_ids), datetime.now(timezone.utc), f"book_disconnect:{type(exc).__name__}")
-                    except Exception:
-                        logger.exception("Book disconnect callback failed")
+                    self._ws = None
+                    if not self._running:
+                        break
+            except asyncio.TimeoutError:
+                logger.warning("Book WS connect TimeoutError:\n%s", traceback.format_exc())
+                if self._running:
+                    await asyncio.sleep(3)
             except Exception as exc:
-                if self._running and self.on_disconnect:
-                    try:
-                        self.on_disconnect(list(self._assets_ids), datetime.now(timezone.utc), f"book_disconnect:{type(exc).__name__}")
-                    except Exception:
-                        logger.exception("Book disconnect callback failed")
-
+                logger.warning("Book WS connect exception: %s %s\n%s", type(exc).__name__, exc, traceback.format_exc())
+                if self._running:
+                    await asyncio.sleep(3)
             self._ws = None
-            if self._running:
-                await asyncio.sleep(3)
+            if not self._running:
+                break
 
     async def _pinger(self, ws) -> None:
         """Send ping {} every PING_INTERVAL seconds."""
@@ -291,24 +319,43 @@ class PolymarketBookCollector:
             except Exception:
                 pass
 
-    async def _handle_message(self, msg: Dict[str, Any]) -> None:
-        """Route incoming messages by event_type."""
-        event_type = msg.get("event_type")
+    async def _handle_message(self, msg: Any) -> None:
+        """Route incoming messages by event_type.
+
+        Polymarket may emit either a single event dict or a list of event dicts.
+        """
+        if isinstance(msg, list):
+            for item in msg:
+                await self._handle_message(item)
+            return
+
+        if not isinstance(msg, dict):
+            if self._unknown_messages_logged < 5:
+                logger.warning("Book WS unsupported message type=%s msg=%r", type(msg).__name__, msg)
+                self._unknown_messages_logged += 1
+            return
+
+        payload = msg.get("message") if isinstance(msg.get("message"), dict) else msg
+        event_type = payload.get("event_type") or payload.get("type")
         if event_type == "book":
-            self._handle_book(msg)
+            self._handle_book(payload)
         elif event_type == "price_change":
-            self._handle_price_change(msg)
+            self._handle_price_change(payload)
         elif event_type == "best_bid_ask":
-            self._handle_best_bid_ask(msg)
+            self._handle_best_bid_ask(payload)
         elif event_type == "last_trade_price":
-            self._handle_last_trade(msg)
+            self._handle_last_trade(payload)
         elif event_type == "market_resolved":
-            self._handle_resolution(msg)
-            logger.info("Resolution event: %s", msg)
+            self._handle_resolution(payload)
+            logger.info("Resolution event: %s", payload)
         elif event_type in ("tick_size_change", "new_market", "pong", None):
-            pass
+            if event_type is None and self._unknown_messages_logged < 5:
+                logger.warning("Book WS message missing event_type keys=%s msg=%r", sorted(payload.keys()), payload)
+                self._unknown_messages_logged += 1
         else:
-            logger.debug("Unknown event type=%r msg=%r", event_type, msg)
+            if self._unknown_messages_logged < 5:
+                logger.warning("Book WS unknown event type=%r msg=%r", event_type, payload)
+                self._unknown_messages_logged += 1
 
     async def _carry_forward_loop(self) -> None:
         """Background task: emit stale carry-forward records for silent tokens."""
@@ -348,8 +395,10 @@ class PolymarketBookCollector:
             if old_ids and not new_ids.issuperset(old_ids):
                 if self._ws:
                     try:
+                        self._expected_close = True
                         await self._ws.close()
                     except Exception:
+                        self._expected_close = False
                         pass
                 return
 

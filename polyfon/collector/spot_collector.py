@@ -40,15 +40,17 @@ class BinanceSpotCollector:
 
     async def _consume(self) -> None:
         uri = self._streams()
+        import sys; sys.stderr.write(f"SPOT_CONSUME_START uri={uri!r}\n"); sys.stderr.flush()
         while self._running:
             try:
+                logger.info("Connecting to Binance WS: %s", uri)
                 async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
+                    logger.info("Binance WS connected")
                     async for msg in ws:
                         if not self._running:
                             break
                         try:
                             data = json.loads(msg)
-                            # Handle both single messages and combined stream messages
                             payload = data.get("data", data)
                             symbol = (payload.get("s") or "").replace("USDT", "")
                             price = float(payload.get("c", 0))
@@ -58,9 +60,16 @@ class BinanceSpotCollector:
                                 self._last_message_at[symbol] = ts
                                 if self.on_price:
                                     self.on_price(symbol, price, ts)
+                                else:
+                                    import sys; sys.stderr.write(f"SPOT_NOCB {symbol}\n"); sys.stderr.flush()
                         except Exception:
+                            import sys, traceback; sys.stderr.write(f"SPOT_ERR: {traceback.format_exc()[-300:]}\n"); sys.stderr.flush()
                             continue
             except Exception as exc:
+                import sys, traceback
+                sys.stderr.write(f"BINANCE_WS_FAIL: {exc}\n{traceback.format_exc()}\n")
+                sys.stderr.flush()
+                logger.warning("Binance WS error: %s", exc)
                 if self._running and self.on_disconnect:
                     try:
                         self.on_disconnect(self.coins, datetime.now(timezone.utc), f"spot_disconnect:{type(exc).__name__}")
@@ -89,6 +98,9 @@ class BinanceSpotCollector:
 
     def latest(self, coin: str) -> Optional[float]:
         return self._latest.get(coin.upper())
+
+    def last_seen(self, coin: str) -> Optional[datetime]:
+        return self._last_message_at.get(coin.upper())
 
     def start(self) -> None:
         self._running = True

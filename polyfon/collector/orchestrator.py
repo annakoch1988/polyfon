@@ -17,6 +17,7 @@ from polyfon.models import Window, SpotPrice, OrderBook, RunSession
 from polyfon.collector.market_discovery import PolymarketDiscovery
 from polyfon.collector.spot_collector import BinanceSpotCollector
 from polyfon.collector.book_collector import PolymarketBookCollector
+from polyfon.utils.clock import make_clock
 
 ET_TZ = ZoneInfo("America/New_York")
 logger = logging.getLogger(__name__)
@@ -43,6 +44,8 @@ def _next_window_boundary_et(now_utc: datetime) -> datetime:
 class CollectionOrchestrator:
     def __init__(self, coins: Optional[List[str]] = None):
         self.coins = [c.upper() for c in (coins or settings.coin_list)]
+        # Clock provider: system or Binance server time
+        self._clock = make_clock(settings.clock_source, settings.clock_sync_interval_sec)
         self.discovery = PolymarketDiscovery()
         self.spot = BinanceSpotCollector(
             coins=self.coins,
@@ -73,18 +76,21 @@ class CollectionOrchestrator:
     # ---- persistence callbacks + workers ---------------------------------------
 
     def _on_spot_price(self, symbol: str, price: float, ts: datetime) -> None:
-        self._spot_open_deadlines.pop(symbol.upper(), None)
         try:
-            self._spot_queue.put_nowait((symbol, price, ts))
-        except asyncio.QueueFull:
-            logger.warning("Spot queue full – dropping tick for %s", symbol)
-            asyncio.create_task(
-                self._invalidate_windows_for_underlyings(
-                    [symbol.upper()],
-                    reason="spot_queue_overflow",
-                    ts=ts,
+            self._spot_open_deadlines.pop(symbol.upper(), None)
+            try:
+                self._spot_queue.put_nowait((symbol, price, ts))
+            except asyncio.QueueFull:
+                logger.warning("Spot queue full – dropping tick for %s", symbol)
+                asyncio.create_task(
+                    self._invalidate_windows_for_underlyings(
+                        [symbol.upper()],
+                        reason="spot_queue_overflow",
+                        ts=ts,
+                    )
                 )
-            )
+        except Exception:
+            logger.exception("_on_spot_price error for %s", symbol)
 
     async def _spot_worker(self) -> None:
         while self._running:
@@ -111,7 +117,7 @@ class CollectionOrchestrator:
             await asyncio.sleep(0.25)
             if not self._running:
                 break
-            now = datetime.now(timezone.utc)
+            now = self._clock.now_utc()
             overdue = [
                 underlying
                 for underlying, deadline in list(self._spot_open_deadlines.items())
@@ -207,6 +213,19 @@ class CollectionOrchestrator:
             windows = result.scalars().all()
             count = 0
             for win in windows:
+                # Grace period: avoid invalidating right at window open for
+                # transient book WS hiccups (e.g., reconnect on subscription
+                # update). If the disconnect persists, a subsequent callback
+                # will fire after the grace and invalidate.
+                if reason.startswith("book_disconnect"):
+                    opened_ago_sec = 0.0
+                    try:
+                        opened_ago_sec = (self._naive_utc(ts) - win.start_et).total_seconds()
+                    except Exception:
+                        opened_ago_sec = 0.0
+                    if opened_ago_sec < 3.0:
+                        # Skip early invalidation within 3s of window open.
+                        continue
                 if win.id in self._invalidated_window_ids:
                     continue
                 win.status = "invalid"
@@ -310,7 +329,7 @@ class CollectionOrchestrator:
 
     async def _sync_windows(self) -> None:
         """Discover events and upsert Window records."""
-        now_n = self._naive_utc(datetime.now(timezone.utc))
+        now_n = self._naive_utc(self._clock.now_utc())
         events = await self.discovery.discover_crypto_5min(coins=self.coins)
 
         async with session_scope() as sess:
@@ -384,11 +403,12 @@ class CollectionOrchestrator:
         """Timer-driven window open/close at 5-min ET clock boundaries.
 
         Sleeps precisely to each boundary, opens the current window and
-        closes the previous one, then sleeps 5 min to the next boundary.
-        No polling, no grace windows.
+        closes the previous one, then refreshes discovery for future windows.
+        Boundary-critical state changes happen before any network discovery so
+        HTTP latency cannot delay OPEN/CLOSED transitions.
         """
         while self._running:
-            now = datetime.now(timezone.utc)
+            now = self._clock.now_utc()
             next_boundary = _next_window_boundary_et(now)
             dt = (next_boundary - now).total_seconds()
             if dt > 0:
@@ -404,8 +424,8 @@ class CollectionOrchestrator:
                 result = await sess.execute(
                     select(Window).where(
                         Window.status == "open",
-                        Window.end_et >= now_n - timedelta(seconds=1),
-                        Window.end_et <= now_n + timedelta(seconds=1),
+                        Window.end_et >= now_n - timedelta(seconds=2),
+                        Window.end_et <= now_n + timedelta(seconds=2),
                     )
                 )
                 for win in result.scalars():
@@ -420,8 +440,8 @@ class CollectionOrchestrator:
                 result = await sess.execute(
                     select(Window).where(
                         Window.status == "pending",
-                        Window.start_et >= now_n - timedelta(seconds=1),
-                        Window.start_et <= now_n + timedelta(seconds=1),
+                        Window.start_et >= now_n - timedelta(seconds=2),
+                        Window.start_et <= now_n + timedelta(seconds=2),
                     )
                 )
                 for win in result.scalars():
@@ -429,9 +449,14 @@ class CollectionOrchestrator:
                     self._discovered_windows[win.slug] = win
                     self._token_to_window[win.up_token_id] = win.id
                     self._token_to_window[win.down_token_id] = win.id
-                    self._spot_open_deadlines[win.underlying.upper()] = (
-                        next_boundary + timedelta(seconds=settings.binance_silence_threshold_sec)
-                    )
+                    underlying = win.underlying.upper()
+                    last_spot = self.spot.last_seen(underlying)
+                    if last_spot is None or (next_boundary - last_spot).total_seconds() > settings.binance_silence_threshold_sec:
+                        self._spot_open_deadlines[underlying] = (
+                            next_boundary + timedelta(seconds=settings.binance_silence_threshold_sec)
+                        )
+                    else:
+                        self._spot_open_deadlines.pop(underlying, None)
                     self._log_window("OPEN", win)
                     changed = True
 
@@ -440,6 +465,13 @@ class CollectionOrchestrator:
             # so market_resolved WebSocket events are still received.
             if changed:
                 await self._refresh_book_subscription()
+
+            # Discover additional upcoming windows after boundary-critical state
+            # changes have been applied so network latency cannot delay opens.
+            try:
+                await self._sync_windows()
+            except Exception:
+                logger.exception("Boundary sync_windows failed")
 
     # ---- shutdown -------------------------------------------------------------
 
@@ -451,7 +483,12 @@ class CollectionOrchestrator:
 
     async def run(self) -> None:
         self._running = True
-
+        # Start clock (no-op for system; background-sync for Binance)
+        try:
+            await self._clock.start()
+        except Exception:
+            logger.exception("Clock start failed; falling back to system time")
+        
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -469,7 +506,7 @@ class CollectionOrchestrator:
             sess.add(session)
             self._session_id = session.id
 
-        now = datetime.now(timezone.utc)
+        now = self._clock.now_utc()
         now_n = self._naive_utc(now)
 
         # DB state summary
@@ -517,17 +554,24 @@ class CollectionOrchestrator:
 
         console.print("[bold cyan]Maintenance[/]")
 
-        # 1. Delete unfinished windows (pending + open) from other runs.
+        # 1. Delete previous-run windows that are unusable for analysis:
+        #    - unfinished/invalid windows (pending + open + invalid)
+        #    - any previous-run window with zero persisted order_books rows
         removed = 0
         async with session_scope() as sess:
             result = await sess.execute(
                 select(Window).where(
-                    Window.status.in_(["pending", "open"]),
                     Window.run_session_id != self._session_id,
                     Window.run_session_id.isnot(None),
                 )
             )
             for win in result.scalars():
+                ob_count = await sess.scalar(
+                    select(OrderBook.id).where(OrderBook.window_id == win.id).limit(1)
+                )
+                should_remove = win.status in ["pending", "open", "invalid"] or ob_count is None
+                if not should_remove:
+                    continue
                 removed += 1
                 self._discovered_windows.pop(win.slug, None)
                 self._token_to_window.pop(win.up_token_id, None)
@@ -535,12 +579,14 @@ class CollectionOrchestrator:
                 underlying = win.underlying
                 start_fmt = _fmt_et(win.start_et)
                 end_fmt = _fmt_et(win.end_et)
+                reason = win.invalid_reason or "no_order_books"
                 console.print(
-                    f"  [red]REMOVED[/] {underlying} {start_fmt}–{end_fmt}  (run: {win.run_session_id})"
+                    f"  [red]REMOVED[/] {underlying} {start_fmt}–{end_fmt}  "
+                    f"[dim]{reason}[/]  (run: {win.run_session_id})"
                 )
                 await sess.delete(win)
         if not removed:
-            console.print("  [dim]No unfinished windows to remove[/]")
+            console.print("  [dim]No unusable previous-run windows to remove[/]")
 
         # 2. Resolve closed-but-unresolved windows via API.
         resolved = await self._resolve_orphans()
@@ -563,22 +609,6 @@ class CollectionOrchestrator:
                 if win.status == "open":
                     self._token_to_window[win.up_token_id] = win.id
                     self._token_to_window[win.down_token_id] = win.id
-
-        # Log discovered future windows
-        async with session_scope() as sess:
-            result = await sess.execute(
-                select(Window).where(
-                    Window.underlying.in_(self.coins),
-                    Window.end_et > now_n,
-                ).order_by(Window.start_et)
-            )
-            for win in result.scalars():
-                console.print(
-                    f"  [cyan]DISCOVERED[/] {win.underlying} "
-                    f"{_fmt_et(win.start_et)}–{_fmt_et(win.end_et)}  "
-                    f"[dim]{win.slug}[/]  "
-                    f"[dim]https://polymarket.com/event/{win.slug}[/]"
-                )
 
         # Mid-window check
         next_boundary = _next_window_boundary_et(now)
@@ -708,6 +738,10 @@ class CollectionOrchestrator:
                 if session:
                     session.finished_at = self._naive_utc(datetime.now(timezone.utc))
         await self.spot.stop()
+        try:
+            await self._clock.stop()
+        except Exception:
+            pass
         await self.book.stop()
         for t in self._tasks:
             t.cancel()

@@ -227,6 +227,13 @@ LOG_LEVEL=INFO
 4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX implemented. Remaining: HMM, MIP, PFR, RND, HPE, KLD, ARL, EVT.
 5. **Phase 5**: Python ML bridge (GARCH, EVT, HMM, Hawkes) for advanced strategies.
 
+## Known Issues Resolved
+- **Gamma API pagination broken**: `/events?series_slug=...` capped at 100 events with broken skip pagination. Replaced by synthetic window generation from ET boundary + individual slug-based Gamma lookup (`/events?slug={slug}`).
+- **Aware/naive datetime mismatch**: `_end_from_slug` returned aware UTC but `now_n` in `_sync_windows` was naive, causing `TypeError: can't compare offset-naive and offset-aware datetimes`. Fixed by stripping tzinfo after slug extraction.
+- **ET endDate parsing**: Polymarket endDate strings carry "Z" but represent ET clock time. All paths now parse as ET then convert to UTC.
+- **Spurious book_disconnect invalidations**: 3-second grace period after window open suppresses invalidations caused by subscription setup timing.
+- **Discovery time normalization fix**: Gamma `eventStartTime` / `endDate` are now treated as true UTC instants for recurring 5-minute markets. Discovery normalization prefers these explicit fields over slug-derived timestamps, fixing mislabelled `DISCOVERED` windows such as `btc-updown-5m-1780479000` being shown as `5:25–5:30 AM ET` instead of the correct `5:30–5:35 AM ET`.
+
 ## Agent Protocol
 - After making any functional changes or achieving progress, update this file to reflect the current state. Do not wait to be asked.
 
@@ -249,15 +256,24 @@ The dry run simulation MUST NOT look ahead. At every evaluation point the simula
 - Polymarket entry simulation is long-only. There is no `SHORT_YES` or `SHORT_NO` concept in this project. Bearish exposure must be expressed as `BUY_NO`, not `SELL_YES`.
 - `RunSession` tracks each collector start; `finished_at` null = interrupted.
 - `DryRunSession` tracks each historical replay run; window/trade detail is stored in `dry_run_window_results` and `dry_run_trade_results` for later analysis.
-- Unfinished windows (open/pending from previous sessions) are DELETED at startup, not resolved.
-- Unfinished windows (open/pending from previous sessions) are DELETED at startup (`Maintenance` section), not resolved.
+- Unfinished/invalid windows (open/pending/invalid from previous sessions) are DELETED at startup, and any previous-run window with zero `order_books` rows is also deleted as analytically unusable.
+- Unfinished/invalid windows (open/pending/invalid from previous sessions) are DELETED at startup (`Maintenance` section), and any previous-run window with zero `order_books` rows is also deleted as analytically unusable.
 - Resolution is done by `_resolve_orphans()` which polls the Gamma API (`fetch_resolution(slug)`) for closed-but-unresolved windows. It runs at startup during `Maintenance` and every 60s in the main loop.
 - Gamma API `fetch_resolution(slug)` uses `outcomePrices` (stringified JSON array, e.g. `'["1","0"]'`) not the `outcome` field (always `None` for automated markets). Maps "Up" → "Yes", "Down" → "No".
-- `_series_events` paginates through Gamma API results (skip=0,100,200,...) because the API returns stale events first; current events are typically at skip=600+.
+- **Gamma API discovery fix**: The `/events?series_slug=...` endpoint caps at 100 results and pagination (skip) wraps instead of returning fresh pages. Discovery now generates window slugs synthetically from ET clock boundaries and queries Gamma individually by slug (`/events?slug={slug}`). This reliably returns the correct window with token IDs, condition ID, and title.
+- `_series_events` and `_is_relevant_now` are no longer used for discovery; only `_fetch_event_by_slug` + `_normalise` are called.
+- **Window invalidation at open**: A 3-second grace period suppresses book_disconnect invalidations that fire within 3s of window open (prevents spurious invalidations caused by subscription setup lag).
+- **ET endDate parsing**: Polymarket's `endDate` field carries a trailing "Z" but actually represents America/New_York clock time. All endDate parsing interprets as ET then converts to UTC. Slug epoch (Unix timestamp in slug suffix) is preferred as the primary source of end_utc because it is always correct UTC.
+- **Datetime tz consistency**: All `end_utc` values stored in the DB are naive UTC. `_end_from_slug` returns aware UTC → must `.replace(tzinfo=None)` before storage. Comparisons with `now` in `_series_events` and `_is_relevant_now` must use consistent awareness (both aware or both naive).
+- **Collection startup/boundary fix**: Discovery now anchors on the current ET 5-minute slot boundary so the currently opening window is included instead of being skipped until the next sync. Orchestrator startup no longer re-logs all discovered windows (avoids duplicate `DISCOVERED` spam), and startup/boundary watchdog timing now consistently uses the configured clock source.
+- **Boundary open timing fix**: `_window_manager` now performs OPEN/CLOSED transitions immediately at the ET boundary using already-persisted pending windows, and only runs `_sync_windows()` afterward. This prevents Gamma API latency during boundary discovery from delaying window opens by several seconds.
+- **Spot initial tick invalidation refinement**: At window open, `spot_initial_tick_timeout` is only armed for an underlying if no recent Binance tick has been observed within `binance_silence_threshold_sec`; this prevents false invalidations immediately after boundary transitions when live spot is already flowing.
+- **Expected book reconnect fix**: `PolymarketBookCollector.update_assets()` may intentionally close the WebSocket when token removals require a clean resubscribe. These expected `ConnectionClosed(1000 OK)` events are no longer reported as `book_disconnect:*`, so newly opened windows are not falsely invalidated for self-induced reconnects.
+- **Book payload compatibility hardening**: `PolymarketBookCollector._handle_message()` now accepts both dict and list-shaped WebSocket frames, unwraps nested `message` payloads, and logs the first few unrecognized payload shapes. This prevents silent dropping when Polymarket sends batched or nested market events.
 - Unresolved window tokens stay subscribed even after close, so `market_resolved` WebSocket events can still be received. However, Polymarket does NOT emit `market_resolved` events via WebSocket for automated 5-min markets.
 - Once a window is resolved (`outcome` set), its tokens are removed from the subscription on the next boundary update.
 - The `_window_manager` is timer-driven: sleeps to each 5-min ET boundary, opens/closes deterministically. No polling loop.
-- `_sync_windows` runs every 60s to discover new events; skips windows whose `start_et` is >1s in the past.
+- `_sync_windows` runs at startup and at every 5-min ET boundary; skips windows whose `start_et` is >1s in the past.
 - Open windows are invalidated on confirmed live-data loss: spot disconnect, spot queue overflow, Polymarket book disconnect, Polymarket book queue overflow, and Binance spot silence beyond `binance_silence_threshold_sec`.
 - Binance spot silence invalidation applies both after ticks have been flowing and when no first Binance tick arrives within `binance_silence_threshold_sec` after a window opens.
 - Invalid windows keep `status="invalid"` with `invalid_reason` and `invalidated_at`; no backfill is attempted, and future pending windows may still open normally after reconnect.

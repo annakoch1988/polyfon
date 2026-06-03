@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     coins: str = "BTC,ETH"
     log_level: str = "INFO"
     binance_silence_threshold_sec: float = 5.0
+    # How far ahead to discover/list upcoming windows (minutes)
+    discovery_horizon_minutes: int = 720
+    # Clock source: "system" or "binance"
+    clock_source: str = "system"
+    clock_sync_interval_sec: int = 60
 
     @property
     def coin_list(self) -> List[str]:
