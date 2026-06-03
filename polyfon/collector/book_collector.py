@@ -256,9 +256,17 @@ class PolymarketBookCollector:
                     ping_interval=None,
                     close_timeout=5,
                     open_timeout=10,
+                    proxy=settings.effective_polymarket_ws_proxy_url,
                 ):
                     self._ws = ws
-                    logger.debug("Book WS: connected, subscribing %d assets", len(self._assets_ids))
+                    if settings.effective_polymarket_ws_proxy_url:
+                        logger.info(
+                            "Book WS connected via proxy %s; subscribing %d assets",
+                            settings.effective_polymarket_ws_proxy_url,
+                            len(self._assets_ids),
+                        )
+                    else:
+                        logger.info("Book WS connected; subscribing %d assets", len(self._assets_ids))
                     async with self._lock:
                         if self._assets_ids:
                             await ws.send(json.dumps(self._subscribe_message(self._assets_ids)))

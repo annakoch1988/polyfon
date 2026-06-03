@@ -63,6 +63,33 @@ COINS=BTC,ETH
 LOG_LEVEL=INFO
 ```
 
+### Optional: SOCKS5 proxy support
+
+If Polymarket is blocked from your server region, you can route outbound traffic through a SOCKS5 proxy.
+
+Global proxy for all supported outbound paths:
+
+```env
+SOCKS5_PROXY_URL=socks5://127.0.0.1:1080
+```
+
+Or configure per service:
+
+```env
+POLYMARKET_WS_PROXY_URL=socks5://127.0.0.1:1080
+POLYMARKET_HTTP_PROXY_URL=socks5://127.0.0.1:1080
+BINANCE_WS_PROXY_URL=socks5://127.0.0.1:1080
+```
+
+Notes:
+
+- `SOCKS5_PROXY_URL` is the fallback for all services.
+- `POLYMARKET_WS_PROXY_URL` is used for the Polymarket market websocket.
+- `POLYMARKET_HTTP_PROXY_URL` is used for Gamma/Polymarket HTTP discovery and resolution.
+- `BINANCE_WS_PROXY_URL` is used for Binance spot websocket traffic.
+- Proxy URLs should typically look like `socks5://host:port` or `socks5h://host:port`.
+- If only Polymarket is blocked from your region, prefer setting only `POLYMARKET_WS_PROXY_URL` and `POLYMARKET_HTTP_PROXY_URL` so Binance stays direct.
+
 ---
 
 ## CLI Reference

@@ -6,10 +6,13 @@ from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
 
 import websockets
+from rich.console import Console
+from websockets.exceptions import InvalidStatus
 
 from polyfon.config import settings
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 
 class BinanceSpotCollector:
@@ -40,11 +43,19 @@ class BinanceSpotCollector:
 
     async def _consume(self) -> None:
         uri = self._streams()
-        import sys; sys.stderr.write(f"SPOT_CONSUME_START uri={uri!r}\n"); sys.stderr.flush()
+        proxy = settings.effective_binance_ws_proxy_url
         while self._running:
             try:
-                logger.info("Connecting to Binance WS: %s", uri)
-                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
+                if proxy:
+                    logger.info("Connecting to Binance WS via proxy %s: %s", proxy, uri)
+                else:
+                    logger.info("Connecting to Binance WS: %s", uri)
+                async with websockets.connect(
+                    uri,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    proxy=proxy,
+                ) as ws:
                     logger.info("Binance WS connected")
                     async for msg in ws:
                         if not self._running:
@@ -60,15 +71,34 @@ class BinanceSpotCollector:
                                 self._last_message_at[symbol] = ts
                                 if self.on_price:
                                     self.on_price(symbol, price, ts)
-                                else:
-                                    import sys; sys.stderr.write(f"SPOT_NOCB {symbol}\n"); sys.stderr.flush()
                         except Exception:
-                            import sys, traceback; sys.stderr.write(f"SPOT_ERR: {traceback.format_exc()[-300:]}\n"); sys.stderr.flush()
+                            logger.exception("Failed to process Binance ticker payload")
                             continue
+            except InvalidStatus as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code is None:
+                    status_code = getattr(exc, "status_code", None)
+                proxy_note = f" via proxy {proxy}" if proxy else ""
+                message = (
+                    f"Binance WS handshake rejected{proxy_note}: "
+                    f"HTTP {status_code or 'unknown'}"
+                )
+                logger.warning("%s", message)
+                console.print(
+                    f"  [bold red]BINANCE WS REJECTED[/] HTTP {status_code or 'unknown'}"
+                    f"[dim]{proxy_note}[/]"
+                )
+                if self._running and self.on_disconnect:
+                    try:
+                        self.on_disconnect(
+                            self.coins,
+                            datetime.now(timezone.utc),
+                            f"spot_disconnect:HTTP_{status_code or 'unknown'}",
+                        )
+                    except Exception:
+                        logger.exception("Spot disconnect callback failed")
+                await asyncio.sleep(5)
             except Exception as exc:
-                import sys, traceback
-                sys.stderr.write(f"BINANCE_WS_FAIL: {exc}\n{traceback.format_exc()}\n")
-                sys.stderr.flush()
                 logger.warning("Binance WS error: %s", exc)
                 if self._running and self.on_disconnect:
                     try:

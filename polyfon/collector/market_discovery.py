@@ -32,7 +32,10 @@ class PolymarketDiscovery:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(
+            timeout=15.0,
+            proxy=settings.effective_polymarket_http_proxy_url,
+        ) as client:
             resp = await client.get(f"{self.base_url}{path}", params=params)
             resp.raise_for_status()
             return resp.json()
