@@ -35,6 +35,18 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
+After installation you can run Polyfon either as:
+
+```bash
+python3 -m scripts.run <command>
+```
+
+or via the installed console script:
+
+```bash
+polyfon <command>
+```
+
 ### Configuration
 
 ```bash
@@ -55,17 +67,22 @@ LOG_LEVEL=INFO
 
 ## CLI Reference
 
-All commands are run via:
+All commands are run via either:
 
 ```bash
-python -m scripts.run <command> [options]
+python3 -m scripts.run <command> [options]
+polyfon <command> [options]
 ```
 
 ### `collect` — Data Collection Only
 
 ```bash
-python -m scripts.run collect                    # default coins from .env
-python -m scripts.run collect --coins=BTC,ETH
+python3 -m scripts.run collect                    # default coins from .env
+python3 -m scripts.run collect --coins=BTC,ETH
+
+# equivalent
+polyfon collect
+polyfon collect --coins=BTC,ETH
 ```
 
 - Discovers active 5-minute crypto markets via Polymarket REST API
@@ -79,10 +96,10 @@ python -m scripts.run collect --coins=BTC,ETH
 Runs a strategy on historical windows already in the database. Computes signals and realized PnL using resolved outcomes.
 
 ```bash
-python -m scripts.run dry --strategy=WDM
-python -m scripts.run dry --strategy=TDE --coins=BTC
-python -m scripts.run dry --strategy=ROM --param tau_max=90 --param tau_min=45
-python -m scripts.run dry --strategy=SLA --window-slugs=BTC_20260524_0510,BTC_20260524_0515
+python3 -m scripts.run dry --strategy=WDM
+python3 -m scripts.run dry --strategy=TDE --coins=BTC
+python3 -m scripts.run dry --strategy=ROM --param tau_max=90 --param tau_min=45
+python3 -m scripts.run dry --strategy=SLA --window-slugs=BTC_20260524_0510,BTC_20260524_0515
 ```
 
 Options:
@@ -103,15 +120,94 @@ Output: per-window status (`SIGNAL` / `SKIP`), trade signals logged to DB, reali
 Like wet mode but no real orders. Tracks simulated PnL in real time.
 
 ```bash
-python -m scripts.run shadow --strategy=WDM --collect
-python -m scripts.run shadow --strategy=TDE --coins=BTC,ETH
+python3 -m scripts.run shadow --strategy=WDM --collect
+python3 -m scripts.run shadow --strategy=TDE --coins=BTC,ETH
 ```
 
 ### `list-strategies`
 
 ```bash
-python -m scripts.run list-strategies
+python3 -m scripts.run list-strategies
+polyfon list-strategies
 ```
+
+---
+
+## Collection Troubleshooting
+
+### Order books are not being collected
+
+If `spot_prices` are arriving but `order_books` stay empty or barely grow, check the following:
+
+1. **Use the current invocation style**
+
+   Prefer:
+
+   ```bash
+   python3 -m scripts.run collect
+   ```
+
+   or:
+
+   ```bash
+   polyfon collect
+   ```
+
+2. **Watch for discovery/open logs**
+
+   The order-book collector only subscribes after market discovery yields token IDs for pending/open windows. On startup you should see log lines like:
+
+   - `DISCOVERED ...`
+   - `OPEN ...`
+
+   If you see only status lines like `waiting for next window` and never see `DISCOVERED`, then the issue is upstream in market discovery, not the websocket book collector.
+
+3. **Understand what gets subscribed**
+
+   Polyfon does **not** subscribe to a generic global Polymarket book feed. It subscribes only to token IDs belonging to windows discovered by Gamma. No discovered windows = no order-book subscription = no `order_books` rows.
+
+4. **Check the DB directly**
+
+   ```bash
+   sqlite3 polyfon.db "select count(*) from windows;"
+   sqlite3 polyfon.db "select status, count(*) from windows group by status;"
+   sqlite3 polyfon.db "select count(*) from order_books;"
+   ```
+
+   If `windows` is empty or only contains stale/old rows, order-book collection will not start correctly for the current session.
+
+5. **Expected startup behavior**
+
+   On a healthy startup, collection should do all of the following:
+
+   - initialize the DB
+   - discover upcoming 5-minute windows
+   - start Binance spot collection immediately
+   - start Polymarket book collection once token IDs are available
+   - open the active window exactly on the ET 5-minute boundary
+
+6. **Current implementation detail**
+
+   Order-book collection is boundary- and discovery-driven. If you start in the middle of a slot, Polyfon may wait until the next window boundary before you see the first meaningful stream of book updates for the newly opened window.
+
+### Recommended first-run check
+
+After install:
+
+```bash
+cp .env.example .env
+python3 -m scripts.run collect --coins=BTC
+```
+
+Then in another shell:
+
+```bash
+sqlite3 polyfon.db "select count(*) from spot_prices;"
+sqlite3 polyfon.db "select count(*) from order_books;"
+sqlite3 polyfon.db "select status, count(*) from windows group by status;"
+```
+
+If `spot_prices` grows but `order_books` does not, capture the collector console output — especially whether `DISCOVERED` and `OPEN` lines appear.
 
 ---
 
