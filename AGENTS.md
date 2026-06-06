@@ -100,6 +100,8 @@ polyfon/
         crv.py               # Strategy: Cross-Contract Relative Value
         cll.py               # Strategy: Cross-Asset Correlation Lead-Lag
         vpx.py               # Strategy: CEX Toxicity Volatility Indicator
+        hmm.py               # Strategy: Hidden Markov Model Regime-Switching
+        mip.py               # Strategy: Market Maker Inventory Pressure
     execution/
         engine.py             # ExecutionEngine (dry/shadow mode)
     utils/
@@ -118,6 +120,8 @@ docs/
     crv.md                 # CRV strategy reference
     cll.md                 # CLL strategy reference
     vpx.md                 # VPX strategy reference
+    hmm.md                 # HMM strategy reference
+    mip.md                 # MIP strategy reference
 ```
 
 ## Execution Modes
@@ -207,6 +211,11 @@ python -m scripts.run dry --strategy=VPX
 python -m scripts.run dry --strategy=VPX --param vpx_threshold=2.0 --param beta_vpx=0.3
 python -m scripts.run shadow --strategy=VPX --collect
 
+# MIP examples
+python -m scripts.run dry --strategy=MIP
+python -m scripts.run dry --strategy=MIP --param ip_threshold=0.40 --param tau_min=30
+python -m scripts.run shadow --strategy=MIP --collect
+
 # List strategies
 python -m scripts.run list-strategies
 ```
@@ -224,7 +233,7 @@ LOG_LEVEL=INFO
 1. **Phase 1 (COMPLETE)**: Bootstrap — schema, config, WebSocket collectors, fair pricing, SLA strategy, dry mode, CLI.
 2. **Phase 2 (IN PROGRESS)**: Shadow mode refinement, session tracking, resolution engine (WS + API), orphan cleanup.
 3. **Phase 3**: Wet mode (CLOB API orders, private key). **POSTPONED.**
-4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX implemented. Remaining: HMM, MIP, PFR, RND, HPE, KLD, ARL, EVT.
+4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX, HMM, MIP implemented. Remaining: PFR, RND, HPE, KLD, ARL, EVT.
 5. **Phase 5**: Python ML bridge (GARCH, EVT, HMM, Hawkes) for advanced strategies.
 
 ## Known Issues Resolved
@@ -283,6 +292,7 @@ The dry run simulation MUST NOT look ahead. At every evaluation point the simula
 - **CLL strategy** (`polyfon/strategies/cll.py`): Cross-Asset Correlation Lead-Lag. Entry when leader asset (e.g. BTC) moves significantly and the lagger's Polymarket contract has not repriced. Uses `lookback_seconds` return of leader to predict lagger spot via `beta_lead` coefficient. Fair probability adjusted using conditional volatility `σ_B|A = σ_B × √(1 - ρ²)`. Entry direction: `adjusted_prob > market_price → BUY_YES`, else `BUY_NO`. Documented in `docs/cll.md`.
 - **VPX strategy** (`polyfon/strategies/vpx.py`): CEX Toxicity Volatility Indicator. Detects volatility regime shifts by comparing short-term vs long-term realized vol. When `sigma_short / sigma_long > vpx_threshold`, projects vol forward using `beta_vpx` persistence and reprices contracts. Trades any discrepancy with market price. Documented in `docs/vpx.md`.
 - **HMM strategy** (`polyfon/strategies/hmm.py`): Hidden Markov Model Regime-Switching adaptation. Because the current engine runs one strategy instance at a time, HMM-RS is implemented as a self-contained regime-aware selector rather than a full ensemble allocator. It infers soft posteriors over `calm`, `trending`, `volatile`, and `converging` regimes using only currently available context features (volatility, short/long vol ratio, PM spreads, spot displacement, distance to strike), then applies regime-consistent entry logic. Documented in `docs/hmm.md`.
+- **MIP strategy** (`polyfon/strategies/mip.py`): Market Maker Inventory Pressure Exploitation. Infers aggregate MM inventory skew from the joint behaviour of UP and DOWN token order books via a composite inventory-pressure index: `ip = up_imb - down_imb`. When `|ip| > ip_threshold` (default 0.30), enters in the direction that the MM's forced quote migration predicts: net UP buying pressure → BUY_YES, net NO buying pressure → BUY_NO. Entry window τ ∈ [60, 120]s. Confidence saturates at `theta_sat` (default 0.60). Complements OBI (which uses only UP token) by explicitly modelling the net inventory exposure flowing through both sides of the MM's book.
 - **Book collector diagnostics hardening**: `PolymarketBookCollector` now logs `on_book` callback failures instead of swallowing them silently, handles nested list payloads under `message`, and warns when `book`, `price_change`, `best_bid_ask`, or `last_trade_price` payloads are missing expected structure such as `asset_id`. This is specifically to diagnose live cases where windows are opening but `order_books` are not being persisted.
 - **Book startup sequencing fix**: `CollectionOrchestrator.run()` now starts the DB worker tasks before starting live collectors, and the initial Polymarket book subscription goes through `_refresh_book_subscription()` instead of a separate startup path. This ensures incoming order-book updates are not racing ahead of the persistence worker during fresh startup and adds explicit logs for initial book-subscription size / asset updates.
 - **CLI logging initialization**: `scripts/run.py` now configures stdlib logging from `settings.log_level` at CLI startup. Without this, collector `logger.info(...)` / `logger.warning(...)` messages could be invisible on some machines, making Polymarket book-subscription failures appear silent even after instrumentation.
