@@ -45,6 +45,7 @@ def _theta(
 
 @register
 class TDEStrategy(BaseStrategy):
+    number = 5
     """Time Decay Effect.
 
     Exploits accelerating probability convergence as τ → 0.

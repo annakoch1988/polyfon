@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class SLAStrategy(BaseStrategy):
+    number = 1
     """Spot-Led Latency Arbitrage.
 
     Parameters (empirically discoverable):

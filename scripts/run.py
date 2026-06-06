@@ -243,11 +243,11 @@ def shadow(
 
 @cli.command()
 def list_strategies() -> None:
-    """List available strategies with registration dates, oldest first."""
-    rows = StrategyRegistry.list_strategies_with_dates()
+    """List available strategies with their numbers."""
+    rows = StrategyRegistry.list_strategies_with_numbers()
     console.print("[bold cyan]Available strategies:[/]")
-    for n, dt in rows:
-        console.print(f"  - {n}  ({dt.strftime('%Y-%m-%d %H:%M:%S')} UTC)")
+    for n, num in rows:
+        console.print(f"  - #{num}  {n}")
 
 
 def main() -> None:

@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class ROMStrategy(BaseStrategy):
+    number = 11
     """Range Oscillation Momentum.
 
     Exploits intra-window spot price ranges.  When price has established

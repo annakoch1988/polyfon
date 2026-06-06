@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class MIPStrategy(BaseStrategy):
+    number = 12
     """Market Maker Inventory Pressure Exploitation.
 
     Infers aggregate market-maker inventory skew from the joint behaviour

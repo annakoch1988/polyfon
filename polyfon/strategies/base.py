@@ -114,23 +114,14 @@ class StrategyRegistry:
         return strat_class(**kwargs)
 
     @classmethod
-    def list_strategies_with_dates(cls) -> List[tuple[str, datetime]]:
-        """Return (name, registration_date) sorted oldest → newest.
-
-        The registration date is the first time the module defining the
-        strategy class was imported.  For strategies that pre-date this
-        attribute the default is the current UTC timestamp at import time.
-        """
+    def list_strategies_with_numbers(cls) -> List[tuple[str, int]]:
+        """Return (name, number) sorted by number."""
         return sorted(
-            (
-                (name, getattr(klass, "_registered_at", datetime.utcnow()))
-                for name, klass in cls._strategies.items()
-            ),
+            ((name, getattr(klass, "number", 0)) for name, klass in cls._strategies.items()),
             key=lambda x: x[1],
         )
 
 
 def register(cls: type[BaseStrategy]) -> type[BaseStrategy]:
     """Decorator to register a strategy class."""
-    cls._registered_at = datetime.utcnow()
     return StrategyRegistry.add(cls)

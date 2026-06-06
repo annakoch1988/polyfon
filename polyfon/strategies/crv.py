@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class CRVStrategy(BaseStrategy):
+    number = 6
     """Cross-Contract Relative Value.
 
     The original CRV proposal requires multiple parallel binary contracts

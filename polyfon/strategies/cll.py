@@ -11,6 +11,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class CLLStrategy(BaseStrategy):
+    number = 9
     """Cross-Asset Correlation Lead-Lag.
 
     Exploits persistent asymmetric lead-lag dynamics between crypto assets

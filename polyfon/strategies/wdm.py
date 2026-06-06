@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class WDMStrategy(BaseStrategy):
+    number = 13
     """Window Delta Momentum.
 
     Entry at T-10s based on spot displacement from window open price.

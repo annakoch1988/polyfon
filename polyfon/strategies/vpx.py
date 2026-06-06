@@ -11,6 +11,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class VPXStrategy(BaseStrategy):
+    number = 8
     """CEX Toxicity as a Leading Volatility Indicator (VPX, a.k.a. VPIN-X).
 
     Detects volatility regime shifts by comparing short-term realised

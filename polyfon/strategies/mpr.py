@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class MPRStrategy(BaseStrategy):
+    number = 3
     """Mean Price Reversion.
 
     Enters when the current spot price has deviated significantly from

@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class OBIStrategy(BaseStrategy):
+    number = 7
     """Order Book Imbalance.
 
     Exploits order-book micro-structure by measuring the ratio of bid to

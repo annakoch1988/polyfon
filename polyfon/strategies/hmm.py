@@ -10,6 +10,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class HMMStrategy(BaseStrategy):
+    number = 10
     """Hidden Markov Model Regime-Switching adaptive strategy.
 
     The full proposal describes HMM-RS as a *meta-layer* that dynamically

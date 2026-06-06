@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class PMRStrategy(BaseStrategy):
+    number = 2
     """Price Momentum Reversal.
 
     Detects when an intra-window price extreme has been reached and the

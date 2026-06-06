@@ -8,6 +8,7 @@ from polyfon.utils.fees import taker_fee_usdc
 
 @register
 class VITStrategy(BaseStrategy):
+    number = 4
     """Volume-Spike Informed Trading.
 
     Detects informed trading activity by combining spot-price momentum
