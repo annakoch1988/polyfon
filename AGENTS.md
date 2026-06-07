@@ -102,6 +102,7 @@ polyfon/
         vpx.py               # Strategy: CEX Toxicity Volatility Indicator
         hmm.py               # Strategy: Hidden Markov Model Regime-Switching
         mip.py               # Strategy: Market Maker Inventory Pressure
+        pfr.py               # Strategy: Perpetual Funding Rate Sentiment Arbitrage
     execution/
         engine.py             # ExecutionEngine (dry/shadow mode)
     utils/
@@ -122,8 +123,8 @@ docs/
     vpx.md                 # VPX strategy reference
     hmm.md                 # HMM strategy reference
     mip.md                 # MIP strategy reference
+    pfr.md                 # PFR strategy reference
 ```
-
 ## Execution Modes
 - **collect**: Only data collection. `python -m scripts.run collect --coins=BTC,ETH`
 - **dry**: Run strategy on historical windows saved in DB. No real money.
@@ -233,7 +234,7 @@ LOG_LEVEL=INFO
 1. **Phase 1 (COMPLETE)**: Bootstrap — schema, config, WebSocket collectors, fair pricing, SLA strategy, dry mode, CLI.
 2. **Phase 2 (IN PROGRESS)**: Shadow mode refinement, session tracking, resolution engine (WS + API), orphan cleanup.
 3. **Phase 3**: Wet mode (CLOB API orders, private key). **POSTPONED.**
-4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX, HMM, MIP implemented. Remaining: PFR, RND, HPE, KLD, ARL, EVT.
+4. **Phase 4 (IN PROGRESS)**: Additional strategies — TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX, HMM, MIP, PFR implemented. Remaining: RND, HPE, KLD, ARL, EVT.
 5. **Phase 5**: Python ML bridge (GARCH, EVT, HMM, Hawkes) for advanced strategies.
 
 ## Known Issues Resolved
