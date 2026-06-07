@@ -6,6 +6,9 @@ Polyfon is a Python-based trading infrastructure designed to discover, collect, 
 
 ---
 
+![results-mip](dry-runs/0001-2026-06-07-mip/results.png)
+
+---
 ## Features
 
 - **Real-time data collection** via WebSocket — Binance spot feeds + Polymarket order book
