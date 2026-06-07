@@ -14,5 +14,6 @@ from polyfon.strategies.vpx import VPXStrategy
 from polyfon.strategies.hmm import HMMStrategy
 from polyfon.strategies.mip import MIPStrategy
 from polyfon.strategies.pfr import PFRStrategy
+from polyfon.strategies.evt import EVTStrategy
 
-__all__ = ["BaseStrategy", "Context", "Signal", "StrategyRegistry", "register", "SLAStrategy", "WDMStrategy", "TDEStrategy", "ROMStrategy", "PMRStrategy", "OBIStrategy", "MPRStrategy", "VITStrategy", "CRVStrategy", "CLLStrategy", "VPXStrategy", "HMMStrategy", "MIPStrategy", "PFRStrategy"]
+__all__ = ["BaseStrategy", "Context", "Signal", "StrategyRegistry", "register", "SLAStrategy", "WDMStrategy", "TDEStrategy", "ROMStrategy", "PMRStrategy", "OBIStrategy", "MPRStrategy", "VITStrategy", "CRVStrategy", "CLLStrategy", "VPXStrategy", "HMMStrategy", "MIPStrategy", "PFRStrategy", "EVTStrategy"]
