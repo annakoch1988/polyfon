@@ -145,5 +145,5 @@ python -m scripts.run dry --strategy=VIT \
   --param tau_max=120
 
 # Shadow mode
-python -m scripts.run shadow --strategy=VIT --collect
+python -m scripts.run shadow --strategy=VIT
 ```

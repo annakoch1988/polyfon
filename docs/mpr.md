@@ -121,5 +121,5 @@ python -m scripts.run dry --strategy=MPR \
   --param theta_edge=0.02
 
 # Shadow mode
-python -m scripts.run shadow --strategy=MPR --collect
+python -m scripts.run shadow --strategy=MPR
 ```

@@ -118,6 +118,29 @@ class DryRunTradeResult(Base):
     window_result = relationship("DryRunWindowResult", back_populates="trade_results")
 
 
+class ShadowRunSession(Base):
+    """Tracks one live shadow-mode run."""
+
+    __tablename__ = "shadow_run_sessions"
+
+    id = Column(String, primary_key=True)
+    strategy = Column(String, nullable=False)
+    strategy_params_json = Column(String, nullable=False, default="{}")
+    coins_csv = Column(String, nullable=True)
+    total_windows = Column(Float, nullable=True)
+    processed_windows = Column(Float, nullable=True)
+    signaled_windows = Column(Float, nullable=True)
+    filled_windows = Column(Float, nullable=True)
+    total_trades = Column(Float, nullable=True)
+    total_realized_pnl = Column(Float, nullable=True)
+    started_at = Column(DateTime, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+    status = Column(String, nullable=False, default="running")  # running, completed, interrupted, failed
+    notes = Column(String, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
 class Window(Base):
     """A single 5-minute prediction market window.
 

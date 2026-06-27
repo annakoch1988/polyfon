@@ -15,7 +15,7 @@ Polyfon is a Python-based trading infrastructure designed to discover, collect, 
 - **SQLite database** — single-file, portable, no external daemon
 - **SQLAlchemy 2.0 async ORM** — type-safe async database operations
 - **Pluggable strategy framework** — `@register` decorator + `BaseStrategy` interface
-- **18+ strategy slots** — 12 implemented (SLA, WDM, TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX, HMM); 6 more planned
+- **18 core strategies + 1 supplementary strategy** — implemented so far: SLA, WDM, TDE, ROM, PMR, OBI, MPR, VIT, CRV, CLL, VPX, HMM, MIP, PFR; remaining planned: RND, HPE, KLD, ARL, EVT
 - **Replay plans** — each strategy defines its own dry-mode evaluation cadence
 - **Accurate fee modeling** — Polymarket taker fees per official documentation
 - **Realized PnL reporting** — dry mode fetches resolved Windows and computes net PnL
@@ -172,14 +172,30 @@ Options:
 
 Output: per-window status (`SIGNAL` / `SKIP`), trade signals logged to DB, realized PnL summary.
 
-### `shadow` — Real-Time Simulation
+### `shadow` — Real-Time Live Simulation
 
-Like wet mode but no real orders. Tracks simulated PnL in real time.
+`shadow` is designed to behave as close to `wet` mode as possible without placing real orders.
+
+- subscribes directly to live Binance spot and Polymarket order-book feeds
+- keeps decision-critical market state in memory
+- evaluates the selected strategy on every relevant state change
+- simulates fills immediately from the current in-memory best ask
+- settles positions when the market resolves
+- writes spot/book/signal/position audit data to the database asynchronously in the background
+
+Unlike `collect`, shadow does **not** depend on a DB write → DB read loop for its decisions.
 
 ```bash
-python3 -m scripts.run shadow --strategy=WDM --collect
-python3 -m scripts.run shadow --strategy=TDE --coins=BTC,ETH
+python3 -m scripts.run shadow --strategy=WDM --coins=BTC,ETH
+python3 -m scripts.run shadow --strategy=TDE --coins=BTC
 ```
+
+Important operational note:
+
+- `collect` and `shadow` are separate modes with different purposes
+- `collect` is the archival ingestion mode used to build datasets for `dry`
+- `shadow` is the low-latency live simulation mode
+- shadow persists audit data in the background so you can later inspect whether the strategy made the correct decisions against recorded data
 
 ### `list-strategies`
 
@@ -308,11 +324,11 @@ Add a new strategy by creating `polyfon/strategies/<name>.py`, inheriting `BaseS
 
 ## Architecture
 
-```
-scripts/run.py (click CLI)
+scripts/run.py CLI (click)
     collect   → CollectionOrchestrator
     dry       → ExecutionEngine(mode="dry")
-    shadow    → ExecutionEngine(mode="shadow")
+    shadow    → ShadowRunner (in-memory live simulation)
+    wet       → [POSTPONED]
 
 CollectionOrchestrator:
     PolymarketDiscovery  →  REST: discover 5-min crypto markets

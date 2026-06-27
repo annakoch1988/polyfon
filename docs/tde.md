@@ -153,5 +153,5 @@ python -m scripts.run dry --strategy=TDE \
   --param q_max=50
 
 # Shadow mode
-python -m scripts.run shadow --strategy=TDE --collect
+python -m scripts.run shadow --strategy=TDE
 ```

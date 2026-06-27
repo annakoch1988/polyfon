@@ -160,5 +160,5 @@ python -m scripts.run dry --strategy=CLL \
   --param rho=0.80
 
 # Shadow mode
-python -m scripts.run shadow --strategy=CLL --collect
+python -m scripts.run shadow --strategy=CLL
 ```

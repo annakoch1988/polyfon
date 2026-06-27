@@ -141,5 +141,5 @@ python -m scripts.run dry --strategy=VPX \
   --param beta_vpx=0.3
 
 # Shadow mode
-python -m scripts.run shadow --strategy=VPX --collect
+python -m scripts.run shadow --strategy=VPX
 ```

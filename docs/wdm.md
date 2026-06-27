@@ -188,5 +188,5 @@ python -m scripts.run dry --strategy=WDM \
   --param q_max=50
 
 # Shadow mode with default params
-python -m scripts.run shadow --strategy=WDM --collect
+python -m scripts.run shadow --strategy=WDM
 ```

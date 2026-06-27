@@ -12,6 +12,7 @@ from polyfon.database import init_db
 from polyfon.collector.orchestrator import CollectionOrchestrator
 from polyfon.strategies.base import StrategyRegistry
 from polyfon.execution.engine import ExecutionEngine
+from polyfon.execution.shadow_runner import ShadowRunner
 
 console = Console()
 
@@ -192,7 +193,6 @@ def dry(
 @cli.command()
 @click.option("--strategy", required=True, help="Strategy name to run.")
 @click.option("--coins", default=None, help="Comma-separated coin list.")
-@click.option("--collect", is_flag=True, help="Also run collection in parallel.")
 @click.option(
     "--replay-cadence-seconds",
     type=float,
@@ -203,7 +203,6 @@ def dry(
 def shadow(
     strategy: str,
     coins: str | None,
-    collect: bool,
     replay_cadence_seconds: float | None,
     params: tuple[str, ...],
 ) -> None:
@@ -223,20 +222,13 @@ def shadow(
 
     async def _run() -> None:
         await init_db()
-        orch: CollectionOrchestrator | None = None
-        if collect:
-            orch = CollectionOrchestrator(coins=coin_list)
-            await orch.run()
-
-        engine = ExecutionEngine(mode="shadow", strategy=strat_instance, coins=coin_list)
+        runner = ShadowRunner(strategy=strat_instance, coins=coin_list)
         try:
-            await engine.run_shadow()
+            await runner.run()
         except KeyboardInterrupt:
             console.print("[yellow]Shutting down shadow...[/]")
         finally:
-            await engine.stop()
-            if orch:
-                await orch.stop()
+            await runner.stop()
 
     _run_async_command(_run, "Shadow mode interrupted.")
 

@@ -93,5 +93,5 @@ python -m scripts.run dry --strategy=CRV \
   --param reference_level=0.52
 
 # Shadow mode
-python -m scripts.run shadow --strategy=CRV --collect
+python -m scripts.run shadow --strategy=CRV
 ```

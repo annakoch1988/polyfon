@@ -27,7 +27,7 @@
 scripts/run.py CLI (click)
     collect  →  CollectionOrchestrator
     dry      →  ExecutionEngine(mode="dry")
-    shadow   →  ExecutionEngine(mode="shadow")
+    shadow   →  ShadowRunner (in-memory live simulation)
     wet      →  [POSTPONED]
 
 CollectionOrchestrator:
@@ -41,10 +41,19 @@ ExecutionEngine:
     loads StrategyRegistry → instantiates chosen strategy
     builds Context (spot, book per token, window_open_price, fair prob, tau)
     calls strategy.on_tick(window, context) → Signal
-    logs signal + simulates long-only Polymarket entry (BUY_YES / BUY_NO only) in dry/shadow
+    logs signal + simulates long-only Polymarket entry (BUY_YES / BUY_NO only) in dry
+
+ShadowRunner:
+    PolymarketDiscovery  →  REST API: find active 5-min crypto markets
+    BinanceSpotCollector  →  WebSocket: live spot into memory
+    PolymarketBookCollector  →  WebSocket: live best bid/ask into memory
+    in-memory Context builder  →  range / mean / vol / token books
+    strategy.on_tick(window, context) on every relevant state change
+    simulated BUY_YES / BUY_NO fills from current in-memory best ask
+    async DB audit persistence (spot, book, signals, positions)
 
 Database (SQLite):
-    collect_run_sessions, dry_run_sessions, dry_run_window_results, dry_run_trade_results,
+    collect_run_sessions, dry_run_sessions, shadow_run_sessions, dry_run_window_results, dry_run_trade_results,
     windows, spot_prices, order_books, trade_signals, positions, config
 ```
 
@@ -154,6 +163,7 @@ class MyStrategy(BaseStrategy):
 ## Database Schema (SQLAlchemy)
 - **RunSession** (`collect_run_sessions`): id, started_at, finished_at (null = aborted/crashed)
 - **DryRunSession**: id, mode, strategy, strategy_params_json, coins_csv, window_slugs_csv, replay_cadence_seconds, total_windows, processed_windows, signaled_windows, filled_windows, total_trades, total_realized_pnl, started_at, finished_at, status, notes
+- **ShadowRunSession**: id, strategy, strategy_params_json, coins_csv, total_windows, processed_windows, signaled_windows, filled_windows, total_trades, total_realized_pnl, started_at, finished_at, status, notes
 - **DryRunWindowResult**: id, dry_run_session_id, window_id, strategy, window_index, status, reason, signal_direction, signal_edge, signal_confidence, order_class, signal_time, resolution, realized_pnl, trade_count
 - **DryRunTradeResult**: id, dry_run_window_result_id, position_id, side, order_class, shares, entry_price, notional, entry_fee, total_cost, opened_at, resolution, settlement_price, revenue, fees_paid, pnl, outcome
 - **Window**: id, slug, title, underlying, start_et, end_et, outcome, status (pending/open/closed/resolved), run_session_id, up_token_id, down_token_id, condition_id, fee_rate, tick_size
@@ -182,7 +192,7 @@ python -m scripts.run dry --strategy=TDE
 python -m scripts.run dry --strategy=SLA --coins=BTC,ETH --collect
 
 # Shadow mode (real-time simulation)
-python -m scripts.run shadow --strategy=WDM --coins=BTC,ETH --collect
+python -m scripts.run shadow --strategy=WDM --coins=BTC,ETH
 
 # Dry/Shadow CLI now supports --param key=value (repeatable)
 python -m scripts.run dry --strategy=WDM --param theta_entry=0.0005 --param tau_max=20
@@ -190,32 +200,32 @@ python -m scripts.run dry --strategy=WDM --param theta_entry=0.0005 --param tau_
 # TDE examples
 python -m scripts.run dry --strategy=TDE
 python -m scripts.run dry --strategy=TDE --param tau_max=60 --param theta_entry=0.04
-python -m scripts.run shadow --strategy=TDE --collect
+python -m scripts.run shadow --strategy=TDE
 
 # ROM examples
 python -m scripts.run dry --strategy=ROM
 python -m scripts.run dry --strategy=ROM --param tau_max=90 --param tau_min=45
-python -m scripts.run shadow --strategy=ROM --collect
+python -m scripts.run shadow --strategy=ROM
 
 # VIT examples
 python -m scripts.run dry --strategy=VIT
 python -m scripts.run dry --strategy=VIT --param imb_threshold=0.15 --param v_threshold=0.002
-python -m scripts.run shadow --strategy=VIT --collect
+python -m scripts.run shadow --strategy=VIT
 
 # CLL examples
 python -m scripts.run dry --strategy=CLL
 python -m scripts.run dry --strategy=CLL --param theta_entry=0.02 --param rho=0.80
-python -m scripts.run shadow --strategy=CLL --collect
+python -m scripts.run shadow --strategy=CLL
 
 # VPX examples
 python -m scripts.run dry --strategy=VPX
 python -m scripts.run dry --strategy=VPX --param vpx_threshold=2.0 --param beta_vpx=0.3
-python -m scripts.run shadow --strategy=VPX --collect
+python -m scripts.run shadow --strategy=VPX
 
 # MIP examples
 python -m scripts.run dry --strategy=MIP
 python -m scripts.run dry --strategy=MIP --param ip_threshold=0.40 --param tau_min=30
-python -m scripts.run shadow --strategy=MIP --collect
+python -m scripts.run shadow --strategy=MIP
 
 # List strategies
 python -m scripts.run list-strategies
@@ -297,6 +307,9 @@ The dry run simulation MUST NOT look ahead. At every evaluation point the simula
 - **Book collector diagnostics hardening**: `PolymarketBookCollector` now logs `on_book` callback failures instead of swallowing them silently, handles nested list payloads under `message`, and warns when `book`, `price_change`, `best_bid_ask`, or `last_trade_price` payloads are missing expected structure such as `asset_id`. This is specifically to diagnose live cases where windows are opening but `order_books` are not being persisted.
 - **Book startup sequencing fix**: `CollectionOrchestrator.run()` now starts the DB worker tasks before starting live collectors, and the initial Polymarket book subscription goes through `_refresh_book_subscription()` instead of a separate startup path. This ensures incoming order-book updates are not racing ahead of the persistence worker during fresh startup and adds explicit logs for initial book-subscription size / asset updates.
 - **CLI logging initialization**: `scripts/run.py` now configures stdlib logging from `settings.log_level` at CLI startup. Without this, collector `logger.info(...)` / `logger.warning(...)` messages could be invisible on some machines, making Polymarket book-subscription failures appear silent even after instrumentation.
+- **Shadow mode rearchitecture**: `shadow` no longer runs as a DB-readback loop. It now uses a dedicated in-memory live runner (`polyfon/execution/shadow_runner.py`) that subscribes directly to Binance spot + Polymarket books, evaluates strategies on every relevant live state change, simulates fills immediately from the current in-memory best ask, and settles positions on resolution. Database writes for spot/book/signal/position audit trails are performed asynchronously in the background and are not on the decision-critical path.
+- **Shadow / collect separation**: `collect` remains the archival DB-ingestion mode for later `dry` analysis. `shadow` is now a separate live runtime intended to behave as close to `wet` as possible without placing real orders.
+- **Shadow run tracking**: `shadow` now creates one `shadow_run_sessions` row per live run and updates cumulative counters / realized PnL as windows resolve. Console settlement logs now include a run-level realized PnL summary in addition to the per-window trade result.
 - **SOCKS5 proxy support**: Config now supports `SOCKS5_PROXY_URL` as a global fallback plus service-specific overrides `POLYMARKET_WS_PROXY_URL`, `POLYMARKET_HTTP_PROXY_URL`, and `BINANCE_WS_PROXY_URL`. `PolymarketBookCollector` passes the proxy to `websockets.asyncio.client.connect`, `BinanceSpotCollector` passes the proxy to `websockets.connect`, and `PolymarketDiscovery` passes the proxy to `httpx.AsyncClient`. This is intended for deployments where Polymarket WS access is region-blocked and traffic must egress via a proxy.
 - **Spot WS rejection handling**: `BinanceSpotCollector` now handles websocket handshake rejections such as HTTP 451 with structured logging and a concise rich console line instead of dumping raw tracebacks to stderr. This is particularly relevant when a global proxy is configured but Binance should not be routed through that egress.
 - **SOCKS runtime dependency**: WebSocket proxying via `websockets` requires `python-socks` at runtime. The project dependencies now include `python-socks>=2.5.0`, and `BinanceSpotCollector` prints a concise operator-facing message if a SOCKS proxy is configured but that dependency is missing in the environment.

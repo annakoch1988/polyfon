@@ -142,5 +142,5 @@ python -m scripts.run dry --strategy=MIP \
   --param theta_edge=0.02
 
 # Shadow mode
-python -m scripts.run shadow --strategy=MIP --collect
+python -m scripts.run shadow --strategy=MIP
 ```

@@ -44,7 +44,7 @@ Enter when `|Z_f| > z_min` AND `|epsilon| > theta_entry`.
 ```bash
 python -m scripts.run dry --strategy=PFR
 python -m scripts.run dry --strategy=PFR --param theta_entry=0.03 --param z_min=2.5
-python -m scripts.run shadow --strategy=PFR --collect
+python -m scripts.run shadow --strategy=PFR
 ```
 
 ## References

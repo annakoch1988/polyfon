@@ -137,5 +137,5 @@ python -m scripts.run dry --strategy=SLA \
   --param q_max=250
 
 # Shadow mode
-python -m scripts.run shadow --strategy=SLA --collect
+python -m scripts.run shadow --strategy=SLA
 ```
